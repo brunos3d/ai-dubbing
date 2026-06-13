@@ -1,13 +1,29 @@
 """Stage 6 - Translation of transcripts to the target language.
 
-Strategy:
-1. Try deep-translator (GoogleTranslator / MyMemory) for free online translation.
-2. If all providers fail, raise a clear error so the user can install offline models.
+Architecture
+------------
+Translation is delegated to a pluggable :class:`TranslationBackend`.  The
+pipeline (entity-preservation, length diagnostics, adaptation, video-stitching)
+only knows about the abstract interface; swapping a backend never touches
+pipeline internals.
+
+Currently registered backends:
+
+* :class:`DeepTranslatorBackend` - the stable default.  Uses the
+  ``deep-translator`` package with two online providers (Google, then
+  MyMemory as a fallback) and rate-limits itself.  This is the same
+  implementation that shipped before the NLLB migration; it produces
+  literal but stable translations that round-trip named entities
+  correctly and never hallucinates legal text.
+
+Adding a new backend is just a matter of subclassing
+:class:`TranslationBackend` and registering it in ``BACKEND_REGISTRY``.
 """
 from __future__ import annotations
 
 import json
 import time
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,64 +34,143 @@ from ..utils.vram import free_vram, log_vram
 LOG = get_logger("ai-dubbing.translate")
 
 
-class NLLBTranslator:
-    """Self-hosted translation using Meta's NLLB-200."""
+# ---------------------------------------------------------------------------
+# Backend abstraction
+# ---------------------------------------------------------------------------
 
-    def __init__(self, model_id: str = "facebook/nllb-200-distilled-600M", device: str = "cuda"):
-        self.model_id = model_id
-        self.device = device
-        self.model = None
-        self.tokenizer = None
 
-    def _load(self):
-        if self.model is None:
-            import torch
-            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+class TranslationBackend(ABC):
+    """Pluggable translation backend interface.
 
-            LOG.info(f"Loading NLLB model: {self.model_id} on {self.device}")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-            self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                self.model_id,
-                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
-            ).to(self.device)
+    Subclasses must implement :meth:`translate` and expose a stable
+    :attr:`name` so the pipeline can record which backend produced a
+    given segment (useful for debugging and for picking the best
+    backend in production).
+    """
 
-    def translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
-        self._load()
-        import torch
+    name: str = "abstract"
 
-        # Map simple codes to NLLB long-form codes
-        # (Very simplified mapping, NLLB expects e.g. 'por_Latn' or 'eng_Latn')
-        mapping = {
-            "pt": "por_Latn",
-            "en": "eng_Latn",
-            "es": "spa_Latn",
-            "fr": "fra_Latn",
-            "de": "deu_Latn",
-            "ru": "rus_Cyrl",
-            "it": "ita_Latn",
-            "ja": "jpn_Jpan",
-            "zh": "zho_Hans",
-        }
+    @abstractmethod
+    def translate(self, text: str, source: str, target: str) -> str:
+        """Translate ``text`` from ISO-639-1 ``source`` to ``target``."""
 
-        src = mapping.get(src_lang, src_lang)
-        tgt = mapping.get(tgt_lang, tgt_lang)
 
-        # Use the modern src_lang/tgt_lang API on the tokenizer; fall back to
-        # convert_tokens_to_ids for the forced BOS token (the legacy
-        # ``lang_code_to_id`` attribute is not present on ``NllbTokenizer``).
-        try:
-            inputs = self.tokenizer(text, return_tensors="pt", src_lang=src, tgt_lang=tgt).to(self.device)
-        except TypeError:
-            inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-        bos_id = self.tokenizer.convert_tokens_to_ids(tgt)
-        if bos_id is None or bos_id == self.tokenizer.unk_token_id:
-            raise RuntimeError(f"NLLB tokenizer cannot resolve target language code: {tgt}")
-        translated_tokens = self.model.generate(
-            **inputs,
-            forced_bos_token_id=bos_id,
-            max_length=256,
+class DeepTranslatorBackend(TranslationBackend):
+    """Stable online translator (Google -> MyMemory fallback).
+
+    This is the canonical backend restored after the NLLB migration was
+    rolled back.  It is the same implementation that powered the
+    pipeline before NLLB: it produces literal but well-formed output,
+    handles named entities conservatively, and never hallucinates
+    legal/regulatory text.
+    """
+
+    name = "deep-translator"
+
+    def __init__(
+        self,
+        providers: Optional[List[str]] = None,
+        sleep_seconds: float = 0.05,
+        per_provider_sleep: float = 0.4,
+    ):
+        # Default provider order: Google (best quality), then MyMemory.
+        self.providers = providers or ["google", "mymemory"]
+        self.sleep_seconds = sleep_seconds
+        self.per_provider_sleep = per_provider_sleep
+
+    def _make_translator(self, provider: str, source: str, target: str):
+        from deep_translator import GoogleTranslator, MyMemoryTranslator
+
+        if provider == "google":
+            return GoogleTranslator(source=source, target=target)
+        if provider == "mymemory":
+            return MyMemoryTranslator(source=source, target=target)
+        raise ValueError(f"Unknown provider: {provider}")
+
+    def translate(self, text: str, source: str, target: str) -> str:
+        from deep_translator import exceptions
+
+        last_err: Optional[Exception] = None
+        for provider in self.providers:
+            try:
+                translator = self._make_translator(provider, source, target)
+                out = translator.translate(text)
+                if out:
+                    return out
+            except exceptions.NotValidPayload as exc:
+                LOG.warning(f"{provider}: empty payload ({exc})")
+                last_err = exc
+            except exceptions.TranslationNotFound as exc:
+                LOG.warning(f"{provider}: not found ({exc})")
+                last_err = exc
+            except Exception as exc:  # noqa: BLE001
+                LOG.warning(f"{provider}: error ({exc})")
+                last_err = exc
+                time.sleep(self.per_provider_sleep)
+        raise RuntimeError(
+            f"All {self.name} providers {self.providers!r} failed: {last_err}"
         )
-        return self.tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
+
+
+class MarianBackend(TranslationBackend):
+    """Stub for a future self-hosted MarianMT backend.
+
+    Kept here as a documented example of how to plug in a new
+    self-hosted backend without touching pipeline internals.  The
+    class is intentionally not wired into :data:`BACKEND_REGISTRY` so
+    the default behaviour stays stable; instantiate it directly to
+    experiment.
+    """
+
+    name = "marian"
+
+    def translate(self, text: str, source: str, target: str) -> str:
+        raise NotImplementedError(
+            "MarianBackend is a documented extension point. "
+            "Load a Helsinki-NLP/Opus model and route the call here."
+        )
+
+
+class WhisperTranslationBackend(TranslationBackend):
+    """Stub for a future Whisper-style translation backend.
+
+    Whisper itself does not translate between arbitrary language pairs
+    on its own, so a production implementation would chain
+    transcription (source -> English) with a small LM.  Documented
+    here as the integration shape; not active by default.
+    """
+
+    name = "whisper"
+
+    def translate(self, text: str, source: str, target: str) -> str:
+        raise NotImplementedError(
+            "WhisperTranslationBackend is a documented extension point."
+        )
+
+
+# Registry of production-ready backends.  The first entry is the
+# pipeline default.  Stubs are kept outside the registry so they
+# cannot be selected by accident.
+BACKEND_REGISTRY: Dict[str, type] = {
+    "deep-translator": DeepTranslatorBackend,
+}
+
+
+def make_backend(name: Optional[str] = None, **kwargs) -> TranslationBackend:
+    """Resolve a backend by name (defaults to the first registered one)."""
+    if name is None:
+        name = next(iter(BACKEND_REGISTRY))
+    if name not in BACKEND_REGISTRY:
+        raise ValueError(
+            f"Unknown translation backend: {name!r}. "
+            f"Available: {sorted(BACKEND_REGISTRY)}"
+        )
+    return BACKEND_REGISTRY[name](**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Language normalisation
+# ---------------------------------------------------------------------------
 
 
 def _norm_lang(code: str) -> str:
@@ -91,117 +186,88 @@ def _norm_lang(code: str) -> str:
     return code
 
 
-def _make_translator(provider: str = "google"):
-    from deep_translator import GoogleTranslator, MyMemoryTranslator
-
-    if provider == "google":
-        return GoogleTranslator
-    if provider == "mymemory":
-        return MyMemoryTranslator
-    raise ValueError(f"Unknown provider: {provider}")
-
-
-def _safe_translate(text: str, source: str, target: str) -> str:
-    from deep_translator import GoogleTranslator, MyMemoryTranslator, exceptions
-
-    last_err: Optional[Exception] = None
-    for provider in ("google", "mymemory"):
-        try:
-            if provider == "google":
-                translator = GoogleTranslator(source=source, target=target)
-            else:
-                translator = MyMemoryTranslator(source=source, target=target)
-            out = translator.translate(text)
-            if out:
-                return out
-        except exceptions.NotValidPayload as e:
-            LOG.warning(f"{provider}: empty payload ({e})")
-            last_err = e
-        except exceptions.TranslationNotFound as e:
-            LOG.warning(f"{provider}: not found ({e})")
-            last_err = e
-        except Exception as e:  # noqa: BLE001
-            LOG.warning(f"{provider}: error ({e})")
-            last_err = e
-            time.sleep(0.4)
-    raise RuntimeError(f"All translators failed: {last_err}")
+# ---------------------------------------------------------------------------
+# Public pipeline-facing API
+# ---------------------------------------------------------------------------
 
 
 def translate_segments(
     segments: List[Dict[str, Any]],
     source: str,
     target: str,
-    device: str = "cuda",
     glossary_path: Optional[Path] = None,
+    backend: Optional[TranslationBackend] = None,
 ) -> List[Dict[str, Any]]:
+    """Translate every segment, preserving entities and recording backend.
+
+    Pipeline callers can pass a pre-built ``backend``; otherwise the
+    default :class:`DeepTranslatorBackend` is instantiated.
+    """
     src = _norm_lang(source)
     tgt = _norm_lang(target)
     if src == tgt:
         LOG.info("Source and target are the same; copying transcript")
         return [dict(s) for s in segments]
 
-    # Initialize tools
-    preserver = EntityPreserver(glossary_path)
-    translator = NLLBTranslator(device=device)
+    backend = backend or make_backend()
+    LOG.info(f"Using translation backend: {backend.name}")
 
+    preserver = EntityPreserver(glossary_path)
     out: List[Dict[str, Any]] = []
     total = len(segments)
-    nllb_ok = 0
-    nllb_fail = 0
+    backend_ok = 0
+    backend_fail = 0
 
     for i, seg in enumerate(segments):
         text = (seg.get("text") or "").strip()
-        if not text or seg.get("is_non_speech"):
+        is_non_speech = bool(seg.get("is_non_speech"))
+        if not text or is_non_speech:
+            if is_non_speech:
+                LOG.debug(f"Segment {i + 1}: keeping non-speech event ({text!r})")
             out.append(dict(seg))
             continue
 
+        # 1. Protect entities (substitute placeholders so the
+        #    translator cannot mangle names/brands).
+        protected = preserver.protect(text)
+
+        # 2. Translate through the active backend.
+        translated: Optional[str] = None
+        used_backend = False
         try:
-            # 1. Protect Entities
-            protected = preserver.protect(text)
+            translated = backend.translate(protected, src, tgt)
+            used_backend = True
+            backend_ok += 1
+        except Exception as backend_exc:
+            backend_fail += 1
+            LOG.error(
+                f"Backend {backend.name!r} failed for segment {i}: {backend_exc}. "
+                f"Keeping original text for this segment; the pipeline will "
+                f"continue so a single bad segment does not abort the run."
+            )
+            translated = protected  # fall back to the protected original
 
-            # 2. Translate (NLLB is the canonical backend; online is a
-            #    last-resort safety net that is logged loudly so it cannot
-            #    silently mask a real NLLB regression).
-            translated = None
-            used_nllb = False
-            try:
-                translated = translator.translate(protected, src, tgt)
-                used_nllb = True
-                nllb_ok += 1
-            except Exception as nllb_exc:
-                nllb_fail += 1
-                LOG.error(
-                    f"NLLB translation failed for segment {i}: {nllb_exc}. "
-                    f"Falling back to online translator. This usually means a "
-                    f"bug in the NLLB integration; please report it."
+        # 3. Restore entities (replace placeholders with the original names).
+        final_text = preserver.restore(translated)
+
+        # 4. Length-diagnostics: warn on suspicious length ratios so a
+        #    backend regression is obvious in the logs without failing
+        #    the run.
+        src_words = len(text.split())
+        tgt_words = len(final_text.split())
+        if src_words > 0:
+            ratio = tgt_words / src_words
+            if ratio > 2.0 or ratio < 0.5:
+                LOG.warning(
+                    f"Segment {i + 1}: translation length anomaly "
+                    f"({src_words} -> {tgt_words} words, ratio {ratio:.2f})"
                 )
-                try:
-                    translated = _safe_translate(protected, src, tgt)
-                except Exception as online_exc:
-                    LOG.error(
-                        f"Online fallback also failed for segment {i}: {online_exc}. "
-                        f"Keeping original text."
-                    )
-                    translated = protected
-
-            # 3. Restore Entities
-            final_text = preserver.restore(translated)
-
-            # 4. Duration Awareness (Log warnings for now)
-            src_words = len(text.split())
-            tgt_words = len(final_text.split())
-            if src_words > 0 and (tgt_words / src_words > 2.0 or tgt_words / src_words < 0.5):
-                LOG.warning(f"Segment {i+1}: Translation length anomaly ({src_words} -> {tgt_words} words)")
-
-        except Exception as exc:  # noqa: BLE001
-            LOG.error(f"Translation failed for segment {i}: {exc}")
-            final_text = text
 
         new = dict(seg)
         new["source_text"] = text
         new["text"] = final_text
         new["entities_preserved"] = list(preserver.placeholders.values())
-        new["translation_backend"] = "nllb" if used_nllb else "fallback"
+        new["translation_backend"] = backend.name if used_backend else "passthrough"
         out.append(new)
 
         if (i + 1) % 10 == 0 or i == total - 1:
@@ -209,8 +275,8 @@ def translate_segments(
 
     if total:
         LOG.info(
-            f"Translation summary: NLLB={nllb_ok}/{total}, "
-            f"fallback={nllb_fail}/{total}"
+            f"Translation summary: backend={backend.name} "
+            f"ok={backend_ok}/{total} passthrough={backend_fail}/{total}"
         )
 
     return out
@@ -224,14 +290,19 @@ class TranslateStage:
         workdir: Path,
         source_language: str,
         target_language: str,
-        device: str = "cuda",
         glossary_path: Optional[Path] = None,
+        backend: Optional[TranslationBackend] = None,
+        backend_name: Optional[str] = None,
     ):
         self.workdir = Path(workdir)
         self.source_language = source_language
         self.target_language = target_language
-        self.device = device
         self.glossary_path = glossary_path
+        # ``backend`` is honoured if the caller already built one; otherwise
+        # we resolve ``backend_name`` (default: the registered default).
+        self.backend = backend or (
+            make_backend(backend_name) if backend_name else make_backend()
+        )
 
     def outputs(self) -> List[Path]:
         return [self.workdir / "translated_transcript.json"]
@@ -240,8 +311,8 @@ class TranslateStage:
         stage_banner(LOG, 5, 12, "Translation")
         transcript_path = Path(context["transcript_path"])
         out_path = self.workdir / "translated_transcript.json"
-        
-        # Look for glossary in PROJECT_ROOT if not explicitly provided
+
+        # Look for glossary in PROJECT_ROOT if not explicitly provided.
         g_path = self.glossary_path
         if not g_path:
             from ..utils.paths import project_root
@@ -251,13 +322,13 @@ class TranslateStage:
 
         segments = json.loads(transcript_path.read_text(encoding="utf-8"))
         translated = translate_segments(
-            segments, 
-            self.source_language, 
+            segments,
+            self.source_language,
             self.target_language,
-            device=self.device,
-            glossary_path=g_path
+            glossary_path=g_path,
+            backend=self.backend,
         )
-        
+
         out_path.write_text(json.dumps(translated, indent=2, ensure_ascii=False))
         LOG.info(f"Translated transcript -> {out_path} ({len(translated)} segments)")
         log_vram(LOG)

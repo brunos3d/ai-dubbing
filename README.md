@@ -31,7 +31,7 @@ By default the dub script delivers the full dubbed video next to the input file.
 3. **Speaker Diarization** — pyannote.audio
 4. **Reference Sample Extraction** — Quality-based selection (8–12 s)
 5. **Speech Recognition** — faster-whisper (large-v3) with low-confidence re-verification
-6. **Translation** — NLLB-200 (facebook/nllb-200-distilled-600M)
+6. **Translation** — `deep-translator` (Google → MyMemory fallback). Translation is dispatched through a pluggable `TranslationBackend` interface so future self-hosted models (NLLB, Marian, M2M100, Whisper) can be added without touching pipeline internals.
 7. **Speech Adaptation** — SmolLM2 (HuggingFaceTB/SmolLM2-1.7B-Instruct)
 8. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice)
 9. **Duration Alignment** — FFmpeg `atempo` (librosa fallback)
