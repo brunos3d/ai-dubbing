@@ -31,18 +31,18 @@ class NLLBTranslator:
         if self.model is None:
             import torch
             from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-            
+
             LOG.info(f"Loading NLLB model: {self.model_id} on {self.device}")
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
             self.model = AutoModelForSeq2SeqLM.from_pretrained(
-                self.model_id, 
-                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32
+                self.model_id,
+                torch_dtype=torch.float16 if "cuda" in self.device else torch.float32,
             ).to(self.device)
 
     def translate(self, text: str, src_lang: str, tgt_lang: str) -> str:
         self._load()
         import torch
-        
+
         # Map simple codes to NLLB long-form codes
         # (Very simplified mapping, NLLB expects e.g. 'por_Latn' or 'eng_Latn')
         mapping = {
@@ -56,15 +56,24 @@ class NLLBTranslator:
             "ja": "jpn_Jpan",
             "zh": "zho_Hans",
         }
-        
+
         src = mapping.get(src_lang, src_lang)
         tgt = mapping.get(tgt_lang, tgt_lang)
-        
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+
+        # Use the modern src_lang/tgt_lang API on the tokenizer; fall back to
+        # convert_tokens_to_ids for the forced BOS token (the legacy
+        # ``lang_code_to_id`` attribute is not present on ``NllbTokenizer``).
+        try:
+            inputs = self.tokenizer(text, return_tensors="pt", src_lang=src, tgt_lang=tgt).to(self.device)
+        except TypeError:
+            inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        bos_id = self.tokenizer.convert_tokens_to_ids(tgt)
+        if bos_id is None or bos_id == self.tokenizer.unk_token_id:
+            raise RuntimeError(f"NLLB tokenizer cannot resolve target language code: {tgt}")
         translated_tokens = self.model.generate(
-            **inputs, 
-            forced_bos_token_id=self.tokenizer.lang_code_to_id[tgt],
-            max_length=256
+            **inputs,
+            forced_bos_token_id=bos_id,
+            max_length=256,
         )
         return self.tokenizer.batch_decode(translated_tokens, skip_special_tokens=True)[0]
 
@@ -134,10 +143,12 @@ def translate_segments(
     # Initialize tools
     preserver = EntityPreserver(glossary_path)
     translator = NLLBTranslator(device=device)
-    
+
     out: List[Dict[str, Any]] = []
     total = len(segments)
-    
+    nllb_ok = 0
+    nllb_fail = 0
+
     for i, seg in enumerate(segments):
         text = (seg.get("text") or "").strip()
         if not text or seg.get("is_non_speech"):
@@ -147,18 +158,35 @@ def translate_segments(
         try:
             # 1. Protect Entities
             protected = preserver.protect(text)
-            
-            # 2. Translate
-            # Try NLLB first
+
+            # 2. Translate (NLLB is the canonical backend; online is a
+            #    last-resort safety net that is logged loudly so it cannot
+            #    silently mask a real NLLB regression).
+            translated = None
+            used_nllb = False
             try:
                 translated = translator.translate(protected, src, tgt)
-            except Exception as e:
-                LOG.warning(f"NLLB failed for segment {i}, falling back to online: {e}")
-                translated = _safe_translate(protected, src, tgt)
-            
+                used_nllb = True
+                nllb_ok += 1
+            except Exception as nllb_exc:
+                nllb_fail += 1
+                LOG.error(
+                    f"NLLB translation failed for segment {i}: {nllb_exc}. "
+                    f"Falling back to online translator. This usually means a "
+                    f"bug in the NLLB integration; please report it."
+                )
+                try:
+                    translated = _safe_translate(protected, src, tgt)
+                except Exception as online_exc:
+                    LOG.error(
+                        f"Online fallback also failed for segment {i}: {online_exc}. "
+                        f"Keeping original text."
+                    )
+                    translated = protected
+
             # 3. Restore Entities
             final_text = preserver.restore(translated)
-            
+
             # 4. Duration Awareness (Log warnings for now)
             src_words = len(text.split())
             tgt_words = len(final_text.split())
@@ -173,10 +201,17 @@ def translate_segments(
         new["source_text"] = text
         new["text"] = final_text
         new["entities_preserved"] = list(preserver.placeholders.values())
+        new["translation_backend"] = "nllb" if used_nllb else "fallback"
         out.append(new)
-        
+
         if (i + 1) % 10 == 0 or i == total - 1:
             LOG.info(f"Translated {i + 1}/{total} segments")
+
+    if total:
+        LOG.info(
+            f"Translation summary: NLLB={nllb_ok}/{total}, "
+            f"fallback={nllb_fail}/{total}"
+        )
 
     return out
 

@@ -179,7 +179,7 @@ class GenerateStage:
             full_audio = full_audio.mean(axis=0)
 
         speaker_profiles: Dict[str, Any] = context.get("speaker_profiles", {})
-        segments = json.loads(translated_path.read_text(encoding="utf-8"))
+        segments = json.loads(transcript_path.read_text(encoding="utf-8"))
         if not segments:
             raise RuntimeError("No translated segments to synthesize")
 
