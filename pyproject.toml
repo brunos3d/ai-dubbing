@@ -1,0 +1,41 @@
+[project]
+name = "ai-dubbing"
+version = "0.1.0"
+description = "Local-first multilingual dubbing pipeline (Demucs + pyannote + faster-whisper + OmniVoice + FFmpeg)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Audio
+    "soundfile>=0.12",
+    "numpy>=1.26",
+    # Demucs (uses torchaudio)
+    "demucs>=4.0.1",
+    # Pyannote.audio (diarization)
+    "pyannote.audio>=3.1",
+    # faster-whisper (ASR)
+    "faster-whisper>=1.0.0",
+    # Omnivoice (k2-fsa)
+    "omnivoice>=0.1.5",
+    # Translation
+    "deep-translator>=1.11",
+    # Utilities
+    "tqdm>=4.66",
+    "rich>=13.7",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+torch-cuda = [
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+]
+
+[project.scripts]
+ai-dubbing = "src.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
