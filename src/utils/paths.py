@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +14,12 @@ def project_root() -> Path:
 
 
 def working_dir(workdir: Optional[Path] = None) -> Path:
-    base = Path(workdir) if workdir is not None else (PROJECT_ROOT / "working")
+    if workdir is not None:
+        base = Path(workdir)
+    else:
+        # Default to system temp dir to avoid repo pollution
+        base = Path(tempfile.gettempdir()) / "ai-dubbing" / "default"
+    
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -24,8 +30,11 @@ def output_dir(outdir: Optional[Path] = None) -> Path:
     return base
 
 
-def log_dir() -> Path:
-    d = PROJECT_ROOT / "logs"
+def log_dir(workdir: Optional[Path] = None) -> Path:
+    if workdir:
+        d = workdir / "logs"
+    else:
+        d = working_dir() / "logs"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

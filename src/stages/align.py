@@ -198,7 +198,8 @@ class AlignStage:
 
         for entry in manifest:
             src_path = Path(entry["path"])
-            target_dur = max(0.1, float(entry.get("original_duration", 0.0)))
+            target_dur = float(entry.get("original_duration") or entry.get("target_duration") or 0.0)
+            target_dur = max(0.1, target_dur)
             cur_dur = float(entry.get("generated_duration", 0.0))
             out_path = self.out_dir / src_path.name
             chosen_dur = cur_dur

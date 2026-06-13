@@ -63,6 +63,47 @@ def _relabel_speakers(segments: List[Dict[str, Any]], prefix: str = "speaker_") 
     return out
 
 
+def _merge_tiny_speakers(
+    segments: List[Dict[str, Any]],
+    min_total_duration: float = 2.0,
+    min_segments: int = 2,
+) -> List[Dict[str, Any]]:
+    """Merge speakers with very little material into the dominant speaker."""
+    if not segments:
+        return []
+
+    stats: Dict[str, Dict[str, Any]] = {}
+    for seg in segments:
+        spk = seg["speaker"]
+        if spk not in stats:
+            stats[spk] = {"duration": 0.0, "count": 0}
+        stats[spk]["duration"] += seg["end"] - seg["start"]
+        stats[spk]["count"] += 1
+
+    if not stats:
+        return segments
+
+    dominant_speaker = max(stats.keys(), key=lambda k: stats[k]["duration"])
+    to_merge = set()
+    for spk, data in stats.items():
+        if spk == dominant_speaker:
+            continue
+        if data["duration"] < min_total_duration or data["count"] < min_segments:
+            LOG.info(f"Merging unreliable speaker {spk} ({data['duration']:.2f}s, {data['count']} segs) into {dominant_speaker}")
+            to_merge.add(spk)
+
+    if not to_merge:
+        return segments
+
+    out = []
+    for seg in segments:
+        new = dict(seg)
+        if new["speaker"] in to_merge:
+            new["speaker"] = dominant_speaker
+        out.append(new)
+    return out
+
+
 # -----------------------------
 # Fallback diarization
 # -----------------------------
@@ -301,7 +342,8 @@ class DiarizeStage:
                         kwargs["max_speakers"] = self.max_speakers
                     diarization = pipeline(audio_in, **kwargs)
                     raw_segments = _annotation_to_segments(diarization)
-                    segments = _relabel_speakers(raw_segments)
+                    merged_segments = _merge_tiny_speakers(raw_segments)
+                    segments = _relabel_speakers(merged_segments)
                     try:
                         del pipeline
                     except Exception:
@@ -328,7 +370,8 @@ class DiarizeStage:
         else:
             target = self.max_speakers or self.fallback_num_speakers
         raw_segments = _fallback_diarize(mono, sr, num_speakers=target)
-        segments = _relabel_speakers(raw_segments)
+        merged_segments = _merge_tiny_speakers(raw_segments)
+        segments = _relabel_speakers(merged_segments)
         speakers = sorted({s["speaker"] for s in segments})
         LOG.info(f"Fallback diarization: {len(speakers)} speakers / {len(segments)} segments")
         out_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False))

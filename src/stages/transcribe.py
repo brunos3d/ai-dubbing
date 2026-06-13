@@ -40,28 +40,117 @@ def _check_vram_or_skip(needed_gb: float = 1.5) -> bool:
 def _group_words_into_segments(
     words: List[Dict[str, Any]],
     speaker: str,
-    max_gap: float = 0.6,
+    max_gap: float = 0.8,
+    target_duration: float = 10.0,
+    max_duration: float = 15.0,
 ) -> List[Dict[str, Any]]:
-    """Group word-level timestamps into utterance-level segments per speaker."""
+    """Group word-level timestamps into utterance-level segments per speaker.
+
+    Prefers longer utterances (target 8-12s) to improve prosodic flow and
+    voice stability. Only splits when a natural boundary (sentence or clause)
+    is reached and the duration is sufficient.
+    """
     out: List[Dict[str, Any]] = []
     buf: List[Dict[str, Any]] = []
+
     for w in words:
+        # 1. Natural gap split (always respect large pauses)
         if buf and (w["start"] - buf[-1]["end"]) > max_gap:
-            out.append(_finalize_segment(buf, speaker))
+            out.extend(_split_if_long(buf, speaker, target_duration, max_duration))
             buf = []
+
         buf.append(w)
+
+        # 2. Smart boundary split
+        # We check if the current buffer is already reasonably long.
+        # If it's over target_duration and ends with sentence-ending punctuation, split it.
+        if buf and (buf[-1]["end"] - buf[0]["start"]) >= target_duration:
+            text = buf[-1]["word"].strip()
+            # Only split if we have a clear sentence boundary.
+            if text and text[-1] in ".?!":
+                out.extend(_split_if_long(buf, speaker, target_duration, max_duration))
+                buf = []
+
     if buf:
-        out.append(_finalize_segment(buf, speaker))
+        out.extend(_split_if_long(buf, speaker, target_duration, max_duration))
+
     return [s for s in out if s["text"].strip()]
 
 
+def _split_if_long(
+    words: List[Dict[str, Any]],
+    speaker: str,
+    target_duration: float,
+    max_duration: float,
+) -> List[Dict[str, Any]]:
+    """Recursively split a list of words if it exceeds max_duration."""
+    if not words:
+        return []
+
+    duration = words[-1]["end"] - words[0]["start"]
+    if duration <= max_duration:
+        return [_finalize_segment(words, speaker)]
+
+    # Find the best split point.
+    # Priority 1: Sentence boundaries (. ? !)
+    # Priority 2: Clause boundaries (, ; :)
+    # Priority 3: Largest gap between words
+    best_idx = -1
+    best_score = -1.0
+
+    # We want to split as close to the middle as possible, but respecting punctuation.
+    mid_time = words[0]["start"] + duration / 2.0
+
+    for i in range(len(words) - 1):
+        w = words[i]
+        text = w["word"].strip()
+        gap = words[i + 1]["start"] - w["end"]
+
+        score = 0.0
+        if text and text[-1] in ".?!":
+            score = 100.0
+        elif text and text[-1] in ",;:":
+            score = 50.0
+        else:
+            score = gap * 10.0
+
+        # Distance from middle penalty
+        dist_from_mid = abs(w["end"] - mid_time)
+        score -= dist_from_mid
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    if best_idx == -1:
+        # Fallback: split in the middle
+        best_idx = len(words) // 2
+
+    left = words[: best_idx + 1]
+    right = words[best_idx + 1 :]
+
+    return _split_if_long(left, speaker, target_duration, max_duration) + \
+           _split_if_long(right, speaker, target_duration, max_duration)
+
+
 def _finalize_segment(words: List[Dict[str, Any]], speaker: str) -> Dict[str, Any]:
+    text = " ".join(w["word"] for w in words).strip()
+    
+    # Check if this is a non-speech vocal event
+    # Patterns: [Laughter], (Sigh), [BREATH], etc.
+    is_non_speech = False
+    clean_text = text.lower().strip("[]().,?!")
+    vocal_events = {"laughter", "chuckle", "sigh", "breath", "breathing", "cough", "gasp", "humming"}
+    if clean_text in vocal_events or (text.startswith("[") and text.endswith("]")) or (text.startswith("(") and text.endswith(")")):
+        is_non_speech = True
+
     return {
         "speaker": speaker,
         "start": round(words[0]["start"], 3),
         "end": round(words[-1]["end"], 3),
-        "text": " ".join(w["word"] for w in words).strip(),
+        "text": text,
         "avg_logprob": sum(w.get("logprob", 0.0) for w in words) / max(1, len(words)),
+        "is_non_speech": is_non_speech,
     }
 
 

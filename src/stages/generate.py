@@ -173,131 +173,162 @@ class GenerateStage:
         stage_banner(LOG, 6, 11, "OmniVoice Generation")
 
         translated_path = Path(context["translated_path"])
-        samples_map: Dict[str, str] = context.get("speaker_samples", {})
+        speech_path = Path(context["speech_path"])
+        full_audio, full_sr = read_wav(speech_path)
+        if full_audio.ndim == 2:
+            full_audio = full_audio.mean(axis=0)
+
+        speaker_profiles: Dict[str, Any] = context.get("speaker_profiles", {})
         segments = json.loads(translated_path.read_text(encoding="utf-8"))
         if not segments:
             raise RuntimeError("No translated segments to synthesize")
 
-        speakers = list(samples_map.keys())
+        speakers = list(speaker_profiles.keys())
         if not speakers:
-            raise RuntimeError("No speaker reference samples available")
+            raise RuntimeError("No speaker voice profiles available")
+
+        # --- Narrator Mode Activation ---
+        is_narrator_mode = len(speakers) == 1
+        if is_narrator_mode:
+            LOG.info("Narrator Mode activated: Maintaining stable identity for single speaker.")
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        ref_transcripts: Dict[str, str] = {}
         source_language = context.get("source_language")
-        for spk, path in samples_map.items():
-            try:
-                ref_transcripts[spk] = _transcribe_ref_with_whisper(path, source_language)
-                LOG.info(f"Ref transcript ({spk}): {ref_transcripts[spk][:80]}")
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(f"Could not transcribe {spk} reference: {exc}")
-                ref_transcripts[spk] = ""
+        
+        # Pre-transcribe ALL primary profiles
+        ref_transcripts: Dict[str, str] = {}
+        for spk, spk_data in speaker_profiles.items():
+            p = spk_data["profiles"]["primary"]
+            if p.get("transcript_text"):
+                ref_transcripts[spk] = p["transcript_text"]
+            else:
+                try:
+                    ref_transcripts[spk] = _transcribe_ref_with_whisper(p["reference"], source_language)
+                except Exception as exc:  # noqa: BLE001
+                    LOG.warning(f"Could not transcribe {spk} reference: {exc}")
+                    ref_transcripts[spk] = ""
         free_vram()
 
         LOG.info(f"Loading OmniVoice ({self.model_id}) on {self.device}")
         model = self._load_model()
         sample_rate = int(getattr(model, "sampling_rate", 24000))
-        LOG.info(f"Model sampling rate: {sample_rate} Hz")
-
-        prompts: Dict[str, Any] = {}
-        if self.use_clone_prompt:
-            for spk, path in samples_map.items():
-                wav, sr = _coerce_ref_audio(path)
-                try:
-                    prompts[spk] = model.create_voice_clone_prompt(
-                        ref_audio=(wav, sr),
-                        ref_text=ref_transcripts.get(spk) or None,
-                        preprocess_prompt=True,
-                    )
-                    LOG.info(f"Built voice clone prompt for {spk}")
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning(f"Could not build voice clone prompt for {spk}: {exc}")
 
         manifest: List[Dict[str, Any]] = []
         for i, seg in enumerate(segments):
             text = (seg.get("text") or "").strip()
             speaker = seg.get("speaker", speakers[0])
-            # Validate speaker-to-profile mapping; this guards against the
-            # "all speakers share one voice" failure mode.
-            if speaker not in samples_map:
-                LOG.warning(
-                    f"Segment {i + 1}: speaker={speaker!r} has no profile, "
-                    f"falling back to {speakers[0]!r}"
-                )
+            start_s = float(seg.get("start", 0.0))
+            end_s = float(seg.get("end", 0.0))
+            orig_duration = end_s - start_s
+            
+            if speaker not in speaker_profiles:
                 speaker = speakers[0]
-            speaker_profile_id = speaker
-            ref_audio = samples_map[speaker]
-            ref_transcript = ref_transcripts.get(speaker, "")
+
             out_wav = self.out_dir / f"segment_{i + 1:04d}.wav"
+            
+            # --- Non-Speech Preservation ---
+            if seg.get("is_non_speech"):
+                LOG.info(f"Segment {i + 1:>3}: PRESERVING ORIGINAL (non-speech event: {text})")
+                s0 = int(start_s * full_sr)
+                s1 = int(end_s * full_sr)
+                clip = full_audio[s0:s1]
+                if full_sr != sample_rate:
+                    import librosa
+                    clip = librosa.resample(clip.astype("float32"), orig_sr=full_sr, target_sr=sample_rate)
+                sf.write(str(out_wav), clip, sample_rate, subtype="PCM_16")
+                
+                manifest.append({
+                    "index": i,
+                    "speaker": speaker,
+                    "is_non_speech": True,
+                    "text": text,
+                    "start": start_s,
+                    "end": end_s,
+                    "original_duration": round(orig_duration, 3),
+                    "generated_duration": round(len(clip) / sample_rate, 3),
+                    "path": str(out_wav),
+                })
+                continue
+
+            # --- Stable Identity Generation ---
+            # We always use the 'primary' profile for each speaker to ensure stability.
+            prof_data = speaker_profiles[speaker]["profiles"]["primary"]
+            ref_audio_path = prof_data["reference"]
+            ref_transcript = ref_transcripts.get(speaker, "")
 
             LOG.info(
-                f"Segment {i + 1:>3}: speaker={speaker_profile_id}  "
-                f"ref={Path(ref_audio).name}  "
-                f"ref_text={ref_transcript[:60]!r}{'...' if len(ref_transcript) > 60 else ''}  "
-                f"text={text[:60]!r}{'...' if len(text) > 60 else ''}"
+                f"Segment {i + 1:>3}: speaker={speaker} profile=primary "
+                f"dur={orig_duration:.2f}s text={text[:60]!r}"
             )
 
+            wav, sr = _coerce_ref_audio(ref_audio_path)
             kwargs: Dict[str, Any] = {
                 "text": text,
                 "language": _lang_name(self.target_language),
+                "ref_audio": (wav, sr),
+                "ref_text": ref_transcript or None,
+                "duration": float(orig_duration),
             }
-            if speaker in prompts:
-                kwargs["voice_clone_prompt"] = prompts[speaker]
-            else:
-                wav, sr = _coerce_ref_audio(ref_audio)
-                kwargs["ref_audio"] = (wav, sr)
-                kwargs["ref_text"] = ref_transcript or None
 
             try:
                 audios = model.generate(**kwargs)
             except Exception as exc:  # noqa: BLE001
-                LOG.warning(f"Segment {i + 1} failed with prompt, falling back: {exc}")
-                wav, sr = _coerce_ref_audio(ref_audio)
+                LOG.warning(f"Segment {i + 1} failed with duration conditioning, falling back: {exc}")
                 audios = model.generate(
                     text=text,
                     language=_lang_name(self.target_language),
                     ref_audio=(wav, sr),
                     ref_text=ref_transcript or None,
                 )
+            
             if not audios:
                 raise RuntimeError(f"OmniVoice produced no audio for segment {i + 1}")
+            
             audio = audios[0]
             if isinstance(audio, torch.Tensor):
                 audio = audio.detach().cpu().numpy()
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
             sf.write(str(out_wav), audio, sample_rate, subtype="PCM_16")
-            duration = float(audio.shape[0]) / sample_rate
-
-            # Validation: the segment speaker id MUST match the voice
-            # profile id actually used; if they ever diverge we want to
-            # catch it loudly.
-            profile_used = speaker_profile_id
-            speaker_id_ok = profile_used == speaker
-            if not speaker_id_ok:
-                raise RuntimeError(
-                    f"Speaker identity validation FAILED for segment {i + 1}: "
-                    f"segment says {speaker!r} but voice profile used was "
-                    f"{profile_used!r}"
-                )
+            gen_duration = float(audio.shape[0]) / sample_rate
 
             manifest.append({
                 "index": i,
                 "speaker": speaker,
-                "voice_profile_id": profile_used,
-                "speaker_id_ok": speaker_id_ok,
-                "ref_audio": ref_audio,
-                "ref_transcript_chars": len(ref_transcript),
+                "is_non_speech": False,
                 "text": text,
                 "source_text": seg.get("source_text", ""),
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "original_duration": float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)),
-                "generated_duration": round(duration, 3),
+                "start": start_s,
+                "end": end_s,
+                "target_duration": round(orig_duration, 3),
+                "original_duration": round(orig_duration, 3),
+                "generated_duration": round(gen_duration, 3),
                 "path": str(out_wav),
                 "sample_rate": sample_rate,
             })
+
             if (i + 1) % 5 == 0 or i == len(segments):
                 LOG.info(f"Generated {i + 1}/{len(segments)} segments")
+
+        # --- Continuity Metrics ---
+        short_segs = sum(1 for m in manifest if m["original_duration"] < 4.0 and not m["is_non_speech"])
+        ideal_segs = sum(1 for m in manifest if 8.0 <= m["original_duration"] <= 12.0)
+        total_speech = sum(1 for m in manifest if not m["is_non_speech"])
+        
+        # Penalize short segments and switches (switches is 0 in this architecture)
+        continuity_score = 100.0
+        if total_speech > 0:
+            continuity_score -= (short_segs / total_speech) * 40.0
+            continuity_score += (ideal_segs / total_speech) * 10.0
+        continuity_score = max(0.0, min(100.0, continuity_score))
+
+        LOG.info("=" * 60)
+        LOG.info("Voice Continuity Report")
+        LOG.info(f"  Total segments     : {len(segments)}")
+        LOG.info(f"  Short segments (<4s): {short_segs}")
+        LOG.info(f"  Ideal segments (8-12s): {ideal_segs}")
+        LOG.info(f"  Profile switches   : 0 (Architecture enforced)")
+        LOG.info(f"  Continuity Score   : {continuity_score:.1f}/100")
+        LOG.info("=" * 60)
 
         manifest_path = self.out_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))

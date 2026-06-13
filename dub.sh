@@ -64,6 +64,17 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || "${1:-}" == "help" ]]; then
     print_usage
     exit 0
 fi
+
+# Handle cache subcommand
+if [[ "${1:-}" == "cache" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        PYTHON_BIN="$(command -v python3)"
+    fi
+    "$PYTHON_BIN" main.py cache "${@:2}"
+    exit 0
+fi
+
 if [[ $# -lt 3 ]]; then
     print_usage
     exit 1
@@ -226,11 +237,17 @@ echo ">> Target  : $TGT"
 echo ">> Output  : $FINAL_PATH"
 echo ">> Format  : $EFFECTIVE_EMIT (driven by .$OUT_EXT)"
 
+# Use a temporary directory for the pipeline's internal output to avoid
+# repository pollution.
+INTERNAL_OUT=$(mktemp -d)
+trap 'rm -rf "$INTERNAL_OUT"' EXIT
+
 # Suppress the CLI's own success banner — dub.sh will print its own.
 DUB_SHOW_BANNER=1 "$PYTHON_BIN" main.py \
     --input "$INPUT" \
     --source-language "$SRC" \
     --target-language "$TGT" \
+    --output-dir "$INTERNAL_OUT" \
     "${PYTHON_FLAGS[@]}"
 
 # ------------------------------------------------ deliver to final path --
@@ -240,24 +257,24 @@ SRC_FILE=""
 # 1. Prefer the format implied by the user's flag / effective emit.
 case "$EFFECTIVE_EMIT" in
     audio)
-        [[ -f "output/final_audio.wav" ]] && SRC_FILE="output/final_audio.wav"
+        [[ -f "$INTERNAL_OUT/final_audio.wav" ]] && SRC_FILE="$INTERNAL_OUT/final_audio.wav"
         ;;
     *)
-        if [[ -f "output/final_video.mp4" ]]; then
-            SRC_FILE="output/final_video.mp4"
-        elif [[ -f "output/final_audio.wav" ]]; then
-            SRC_FILE="output/final_audio.wav"
+        if [[ -f "$INTERNAL_OUT/final_video.mp4" ]]; then
+            SRC_FILE="$INTERNAL_OUT/final_video.mp4"
+        elif [[ -f "$INTERNAL_OUT/final_audio.wav" ]]; then
+            SRC_FILE="$INTERNAL_OUT/final_audio.wav"
         fi
         ;;
 esac
 # 2. Fall back: take whatever exists.
 if [[ -z "$SRC_FILE" ]]; then
-    for cand in output/final_video.mp4 output/final_audio.wav; do
+    for cand in "$INTERNAL_OUT/final_video.mp4" "$INTERNAL_OUT/final_audio.wav"; do
         if [[ -f "$cand" ]]; then SRC_FILE="$cand"; break; fi
     done
 fi
 if [[ -z "$SRC_FILE" ]]; then
-    echo "ERROR: pipeline produced no output file in output/" >&2
+    echo "ERROR: pipeline produced no output file in $INTERNAL_OUT" >&2
     exit 1
 fi
 

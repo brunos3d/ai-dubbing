@@ -82,7 +82,9 @@ def translate_segments(
     total = len(segments)
     for i, seg in enumerate(segments):
         text = (seg.get("text") or "").strip()
-        if not text:
+        if not text or seg.get("is_non_speech"):
+            if seg.get("is_non_speech"):
+                LOG.info(f"Segment {i + 1}: skipping translation for non-speech event: {text}")
             out.append(dict(seg))
             continue
         try:

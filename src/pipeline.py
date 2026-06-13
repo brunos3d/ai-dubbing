@@ -20,6 +20,7 @@ from .stages import (
     TranscribeStage,
     VideoStage,
 )
+from .utils.cache import CacheManager
 from .utils.checkpoint import Checkpoint
 from .utils.logging import get_logger, setup_logging, stage_banner
 from .utils.paths import env, log_dir, output_dir, working_dir
@@ -28,7 +29,7 @@ LOG = setup_logging("ai-dubbing")
 
 
 class Pipeline:
-    """Runs the 11 stages with checkpointing."""
+    """Runs the 11 stages with checkpointing and cache management."""
 
     STAGES = [
         ("extract", ExtractStage),
@@ -55,19 +56,66 @@ class Pipeline:
         hf_token: Optional[str] = None,
         target_lufs: float = -16.0,
         skip_video: bool = False,
+        no_cache: bool = False,
+        from_stage: Optional[str] = None,
+        read_only_cache: bool = False,
     ):
+        global LOG
         env()
         self.input_path = input_path
         self.source_language = source_language
         self.target_language = target_language
-        self.workdir = working_dir(workdir)
         self.output_dir = output_dir(output_path)
         self.whisper_model = whisper_model
         self.hf_token = hf_token
         self.target_lufs = target_lufs
         self.skip_video = skip_video
+        self.no_cache = no_cache
+        self.from_stage = from_stage
+        self.read_only_cache = read_only_cache
+
+        # Cache resolution
+        self.cache_manager = CacheManager()
+        self.cache_key = self.cache_manager.get_cache_key(input_path)
+        
+        if workdir is not None:
+            self.workdir = Path(workdir).resolve()
+        else:
+            self.workdir = self.cache_manager.get_working_dir(self.cache_key)
+        
+        if self.no_cache and self.workdir.exists():
+            LOG.info("Forcing cache rebuild (--no-cache); clearing workdir")
+            shutil.rmtree(self.workdir)
+
+        self.workdir.mkdir(parents=True, exist_ok=True)
+
+        # Re-initialize logging to use the actual workdir
+        LOG = setup_logging("ai-dubbing", logfile=log_dir(self.workdir) / "pipeline.log")
+
+        LOG.info(f"Cache key: {self.cache_key}")
+        LOG.info(f"Workdir  : {self.workdir}")
+        
+        # Initialize metadata if it's a new cache entry
+        if not (self.workdir / "metadata.json").exists() and not self.read_only_cache:
+            self.cache_manager.init_metadata(
+                self.cache_key, 
+                input_path, 
+                {"whisper_model": whisper_model, "target_lufs": target_lufs}
+            )
 
         self.checkpoint = Checkpoint.load(self.workdir)
+        
+        # If --from-stage is set, invalidate everything from that stage onwards
+        if self.from_stage and self.checkpoint:
+            LOG.info(f"Rebuilding pipeline from stage: {self.from_stage}")
+            found = False
+            for name, _ in self.STAGES:
+                if name == self.from_stage:
+                    found = True
+                if found:
+                    self.checkpoint.stages.pop(name, None)
+            self.checkpoint.save()
+
         same_job = (
             self.checkpoint is not None
             and self.checkpoint.input_path == input_path
@@ -83,7 +131,8 @@ class Pipeline:
                 output_dir=str(self.output_dir),
                 config={"whisper_model": whisper_model, "target_lufs": target_lufs},
             )
-            self.checkpoint.save()
+            if not self.read_only_cache:
+                self.checkpoint.save()
 
     def _build_stage(self, name: str):
         if name == "extract":
@@ -230,6 +279,27 @@ class Pipeline:
         # it points to the aligned manifest for everything past generate.
         if name in {"align", "reconstruct", "mix", "video"}:
             context["manifest_path"] = aligned_manifest
+        spk_profiles_dir = workdir / "speaker_profiles"
+        speaker_profiles: Dict[str, Any] = {}
+        if spk_profiles_dir.exists():
+            for spk_path in spk_profiles_dir.iterdir():
+                if not spk_path.is_dir():
+                    continue
+                spk = spk_path.name
+                speaker_profiles[spk] = {"profiles": {}}
+                for prof_path in spk_path.iterdir():
+                    if not prof_path.is_dir():
+                        continue
+                    meta_path = prof_path / "metadata.json"
+                    if meta_path.exists():
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        speaker_profiles[spk]["profiles"][prof_path.name] = {
+                            "reference": meta["reference_path"],
+                            "transcript_text": (prof_path / "transcript.txt").read_text(encoding="utf-8").strip() if (prof_path / "transcript.txt").exists() else "",
+                            "score": meta.get("score", 0.0),
+                        }
+
+        context["speaker_profiles"] = speaker_profiles
         context["speaker_samples"] = speaker_samples
         context["ref_transcripts"] = ref_transcripts
         context["reconstructed_path"] = str(output_dir / "reconstructed_speech.wav")
@@ -252,6 +322,7 @@ class Pipeline:
             context["speakers"] = result.get("speakers", [])
         elif name == "samples":
             context["speaker_samples"] = result.get("speaker_samples", {})
+            context["speaker_profiles"] = result.get("speaker_profiles", {})
             context["speakers_dir"] = result.get("speakers_dir", str(self.workdir / "speakers"))
         elif name == "transcribe":
             context["transcript_path"] = result.get("transcript_path") or str(self.workdir / "transcript.json")
