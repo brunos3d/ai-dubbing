@@ -60,20 +60,12 @@ def _resolve_emit(args, src_suffix: str) -> str:
 
     Returns one of: ``audio``, ``video``, ``both``.
     """
-    explicit_audio = args.audio_only or args.no_video
-    if explicit_audio and args.emit not in ("auto",):
-        print(
-            f"Conflicting flags: --audio-only and --emit={args.emit}",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    if explicit_audio:
-        return "audio"
-    if args.emit == "audio":
+    # --audio-only and --emit=audio are equivalent; either wins.
+    if args.audio_only or args.no_video or args.emit == "audio":
         return "audio"
     if args.emit == "video":
         return "video"
-    # auto / both / video -> default behaviour: produce video (and audio)
+    # auto / both -> default behaviour: produce video (and audio)
     return "video"
 
 
@@ -109,18 +101,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     out_dir = Path(args.output_dir).resolve()
     final_audio = out_dir / "final_audio.wav"
     final_video = out_dir / "final_video.mp4"
-    print()
-    print("[ok] Dubbing complete.")
-    if emit in ("audio", "both") and final_audio.exists():
-        print(f"     Audio : {final_audio}")
-    if emit in ("video", "both") and final_video.exists():
-        print(f"     Video : {final_video}")
-    if emit == "audio" and final_video.exists():
-        print(
-            f"     (removed: {final_video})"
-            if not final_video.exists()
-            else f"     (keeping: {final_video} — the --audio-only flag does not delete it)"
-        )
+    # When invoked from dub.sh the success banner is produced by the
+    # wrapper; suppress it here to avoid double-printing.
+    if not os.environ.get("DUB_SHOW_BANNER"):
+        print()
+        print("[ok] Dubbing complete.")
+        if emit in ("audio", "both") and final_audio.exists():
+            print(f"     Audio : {final_audio}")
+        if emit in ("video", "both") and final_video.exists():
+            print(f"     Video : {final_video}")
+        if emit == "audio" and final_video.exists():
+            print(
+                f"     (removed: {final_video})"
+                if not final_video.exists()
+                else f"     (keeping: {final_video} — the --audio-only flag does not delete it)"
+            )
     return 0
 
 

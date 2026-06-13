@@ -130,8 +130,16 @@ class Pipeline:
             if self.skip_video and name == "video":
                 LOG.info("Skipping video stage (--no-video / --audio-only)")
                 continue
-            if idx > 0 and not context.get(f"_stage_{self.STAGES[idx - 1][0]}_hydrated"):
-                self._rehydrate_from_disk(context, self.STAGES[idx - 1][0])
+            # Rehydrate ALL prior stages that contributed inputs but haven't
+            # been touched in *this* run.  The previous "just hydrate the
+            # previous stage" approach left later stages with stale context
+            # (e.g. generate running without speaker_samples set).
+            for prev_idx in range(idx):
+                prev_name = self.STAGES[prev_idx][0]
+                if not context.get(f"_stage_{prev_name}_hydrated"):
+                    self._rehydrate_from_disk(context, prev_name)
+                    context[f"_stage_{prev_name}_hydrated"] = True
+
             if self.checkpoint.is_done(name):
                 # Verify the recorded outputs still exist on disk; otherwise
                 # treat the cache as stale and re-run the stage.
@@ -146,7 +154,11 @@ class Pipeline:
                     self.checkpoint.stages.pop(name, None)
                 else:
                     LOG.info(f"[{idx + 1}/{len(self.STAGES)}] {name} (cached)")
-                    self._hydrate_context(context, name)
+                    # Always re-read from disk so speaker_samples, transcripts,
+                    # and similar dynamic collections stay in sync with the
+                    # files actually on disk (the cached ``result`` may be
+                    # empty for resumed runs).
+                    self._rehydrate_from_disk(context, name)
                     context[f"_stage_{name}_hydrated"] = True
                     continue
             stage = self._build_stage(name)
@@ -174,72 +186,55 @@ class Pipeline:
         return context
 
     def _rehydrate_from_disk(self, context: Dict[str, Any], name: str) -> None:
-        """When starting from a mid-pipeline stage, set up the context with
-        the artefacts produced by the named previous stage.
+        """Set up the context with everything stage ``name`` will need on disk.
+
+        Reads the artefacts produced by stage ``name`` (and any earlier
+        stages whose outputs are still required) and stashes them in
+        ``context`` under the keys that downstream stages expect.
         """
         import json
 
         workdir = self.workdir
-        LOG.info(f"rehydrating context from previous stage '{name}'")
+        output_dir = self.output_dir
+        LOG.info(f"rehydrating context for stage '{name}'")
         spk_dir = workdir / "speakers"
         speaker_samples: Dict[str, str] = (
             {p.stem: str(p) for p in spk_dir.glob("*.wav")}
             if spk_dir.exists()
             else {}
         )
-        if name == "extract":
-            context["audio_path"] = str(workdir / "original_audio.wav")
-        elif name == "separate":
-            context["audio_path"] = str(workdir / "original_audio.wav")
-            context["speech_path"] = str(workdir / "speech.wav")
-            context["background_path"] = str(workdir / "background.wav")
-        elif name == "diarize":
-            context["speech_path"] = str(workdir / "speech.wav")
-            context["background_path"] = str(workdir / "background.wav")
-            context["segments_path"] = str(workdir / "segments.json")
-        elif name == "samples":
-            context["speech_path"] = str(workdir / "speech.wav")
-            context["segments_path"] = str(workdir / "segments.json")
-            context["speaker_samples"] = speaker_samples
-        elif name == "transcribe":
-            context["speech_path"] = str(workdir / "speech.wav")
-            context["segments_path"] = str(workdir / "segments.json")
-            context["speaker_samples"] = speaker_samples
-        elif name == "translate":
-            context["transcript_path"] = str(workdir / "transcript.json")
-        elif name == "generate":
-            context["translated_path"] = str(workdir / "translated_transcript.json")
-            context["generated_dir"] = str(workdir / "generated_segments")
-            context["manifest_path"] = str(
-                workdir / "generated_segments" / "manifest.json"
-            )
-            context["speaker_samples"] = speaker_samples
-        elif name == "align":
-            context["generated_dir"] = str(workdir / "generated_segments")
-            context["aligned_dir"] = str(workdir / "aligned_segments")
-            aligned_manifest = str(workdir / "aligned_manifest.json")
-            context["aligned_manifest"] = aligned_manifest
+        ref_transcripts: Dict[str, str] = (
+            {
+                p.parent.name: (p.parent / "transcript.txt").read_text(encoding="utf-8").strip()
+                for p in (workdir / "speaker_profiles").glob("*/transcript.txt")
+            }
+            if (workdir / "speaker_profiles").exists()
+            else {}
+        )
+
+        # Common inputs the pipeline carries forward
+        context.setdefault("audio_path", str(workdir / "original_audio.wav"))
+        context["speech_path"] = str(workdir / "speech.wav")
+        context["background_path"] = str(workdir / "background.wav")
+        context["segments_path"] = str(workdir / "segments.json")
+        context["transcript_path"] = str(workdir / "transcript.json")
+        context["translated_path"] = str(workdir / "translated_transcript.json")
+        context["generated_dir"] = str(workdir / "generated_segments")
+        context["manifest_path"] = str(
+            workdir / "generated_segments" / "manifest.json"
+        )
+        context["aligned_dir"] = str(workdir / "aligned_segments")
+        aligned_manifest = str(workdir / "aligned_manifest.json")
+        context["aligned_manifest"] = aligned_manifest
+        # ``manifest_path`` is read by reconstruct/mix/align so make sure
+        # it points to the aligned manifest for everything past generate.
+        if name in {"align", "reconstruct", "mix", "video"}:
             context["manifest_path"] = aligned_manifest
-            context["background_path"] = str(workdir / "background.wav")
-            context["speaker_samples"] = speaker_samples
-        elif name == "reconstruct":
-            context["manifest_path"] = str(workdir / "aligned_manifest.json")
-            context["aligned_manifest"] = str(workdir / "aligned_manifest.json")
-            context["background_path"] = str(workdir / "background.wav")
-            context["speech_path"] = str(workdir / "speech.wav")
-            context["reconstructed_path"] = str(
-                self.output_dir / "reconstructed_speech.wav"
-            )
-        elif name == "mix":
-            recon = workdir / "reconstructed_speech.wav"
-            if not recon.exists():
-                recon = self.output_dir / "reconstructed_speech.wav"
-            context["reconstructed_path"] = str(recon)
-            context["background_path"] = str(workdir / "background.wav")
-            context["speech_path"] = str(workdir / "speech.wav")
-            context["final_path"] = str(self.output_dir / "final_audio.wav")
-        elif name == "video":
-            context["final_path"] = str(self.output_dir / "final_audio.wav")
+        context["speaker_samples"] = speaker_samples
+        context["ref_transcripts"] = ref_transcripts
+        context["reconstructed_path"] = str(output_dir / "reconstructed_speech.wav")
+        context["final_path"] = str(output_dir / "final_audio.wav")
+        context["final_video"] = str(output_dir / "final_video.mp4")
 
         return context
 
