@@ -35,8 +35,6 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
     run_p.add_argument("--target-lufs", type=float, default=-16.0, help="Loudness target for final mix")
     run_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
-    run_p.add_argument("--adapt-model", default="HuggingFaceTB/SmolLM2-1.7B-Instruct", help="Model for speech adaptation")
-    run_p.add_argument("--adapt-mode", default="YouTube Narrator", help="Adaptation persona (e.g. YouTube Narrator, Documentary, Casual)")
     run_p.add_argument("--start-from", default="extract", help="Stage to start from (for resuming)")
     run_p.add_argument("--only", default=None, help="Run only a single stage (debug)")
     
@@ -193,8 +191,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         no_cache=args.no_cache,
         from_stage=args.from_stage,
         read_only_cache=args.read_only_cache,
-        adapt_model=args.adapt_model,
-        adapt_mode=args.adapt_mode,
         glossary_path=Path(args.glossary).resolve() if args.glossary else None,
     )
     try:

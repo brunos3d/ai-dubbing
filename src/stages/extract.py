@@ -63,7 +63,7 @@ class ExtractStage:
         return [self.workdir / "original_audio.wav", self.workdir / "media_info.json"]
 
     def run(self, input_path: str, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 0, 12, "Audio Extraction")
+        stage_banner(LOG, 0, 11, "Audio Extraction")
         if not shutil.which("ffmpeg"):
             raise RuntimeError("ffmpeg is not on PATH")
         audio_path = self.workdir / "original_audio.wav"

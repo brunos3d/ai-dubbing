@@ -3,8 +3,8 @@
 Architecture
 ------------
 Translation is delegated to a pluggable :class:`TranslationBackend`.  The
-pipeline (entity-preservation, length diagnostics, adaptation, video-stitching)
-only knows about the abstract interface; swapping a backend never touches
+pipeline (entity-preservation, length diagnostics, video-stitching) only
+knows about the abstract interface; swapping a backend never touches
 pipeline internals.
 
 Currently registered backends:
@@ -12,7 +12,7 @@ Currently registered backends:
 * :class:`DeepTranslatorBackend` - the stable default.  Uses the
   ``deep-translator`` package with two online providers (Google, then
   MyMemory as a fallback) and rate-limits itself.  This is the same
-  implementation that shipped before the NLLB migration; it produces
+  implementation that has shipped since the initial commit; it produces
   literal but stable translations that round-trip named entities
   correctly and never hallucinates legal text.
 
@@ -213,6 +213,11 @@ def translate_segments(
     LOG.info(f"Using translation backend: {backend.name}")
 
     preserver = EntityPreserver(glossary_path)
+    if preserver.is_active:
+        LOG.info(f"Entity preservation active for {preserver._loaded_count} glossary terms")
+    else:
+        LOG.info("No glossary supplied; entity preservation disabled, "
+                 "translator will see the source text verbatim")
     out: List[Dict[str, Any]] = []
     total = len(segments)
     backend_ok = 0
@@ -227,8 +232,9 @@ def translate_segments(
             out.append(dict(seg))
             continue
 
-        # 1. Protect entities (substitute placeholders so the
-        #    translator cannot mangle names/brands).
+        # 1. Protect entities ONLY if a glossary was supplied. When the
+        #    glossary is empty, the preserver is a pass-through and the
+        #    translator sees the original text verbatim.
         protected = preserver.protect(text)
 
         # 2. Translate through the active backend.
@@ -247,7 +253,7 @@ def translate_segments(
             )
             translated = protected  # fall back to the protected original
 
-        # 3. Restore entities (replace placeholders with the original names).
+        # 3. Restore entities. No-op when no glossary was supplied.
         final_text = preserver.restore(translated)
 
         # 4. Length-diagnostics: warn on suspicious length ratios so a
@@ -266,7 +272,8 @@ def translate_segments(
         new = dict(seg)
         new["source_text"] = text
         new["text"] = final_text
-        new["entities_preserved"] = list(preserver.placeholders.values())
+        if preserver.placeholders:
+            new["entities_preserved"] = list(preserver.placeholders.values())
         new["translation_backend"] = backend.name if used_backend else "passthrough"
         out.append(new)
 
@@ -308,7 +315,7 @@ class TranslateStage:
         return [self.workdir / "translated_transcript.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 5, 12, "Translation")
+        stage_banner(LOG, 5, 11, "Translation")
         transcript_path = Path(context["transcript_path"])
         out_path = self.workdir / "translated_transcript.json"
 

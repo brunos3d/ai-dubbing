@@ -5,7 +5,6 @@ from .diarize import DiarizeStage
 from .samples import SampleStage
 from .transcribe import TranscribeStage
 from .translate import TranslateStage
-from .adapt import AdaptStage
 from .generate import GenerateStage
 from .align import AlignStage
 from .reconstruct import ReconstructStage
@@ -19,7 +18,6 @@ __all__ = [
     "SampleStage",
     "TranscribeStage",
     "TranslateStage",
-    "AdaptStage",
     "GenerateStage",
     "AlignStage",
     "ReconstructStage",

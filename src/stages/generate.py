@@ -170,9 +170,9 @@ class GenerateStage:
         )
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 7, 12, "OmniVoice Generation") # Updated total stages
+        stage_banner(LOG, 7, 11, "OmniVoice Generation")
 
-        transcript_path = Path(context.get("use_transcript_path", context["translated_path"]))
+        transcript_path = Path(context["translated_path"])
         speech_path = Path(context["speech_path"])
         full_audio, full_sr = read_wav(speech_path)
         if full_audio.ndim == 2:
@@ -186,11 +186,6 @@ class GenerateStage:
         speakers = list(speaker_profiles.keys())
         if not speakers:
             raise RuntimeError("No speaker voice profiles available")
-
-        # --- Narrator Mode Activation ---
-        is_narrator_mode = len(speakers) == 1
-        if is_narrator_mode:
-            LOG.info("Narrator Mode activated: Maintaining stable identity for single speaker.")
 
         self.out_dir.mkdir(parents=True, exist_ok=True)
         source_language = context.get("source_language")
@@ -308,27 +303,6 @@ class GenerateStage:
 
             if (i + 1) % 5 == 0 or i == len(segments):
                 LOG.info(f"Generated {i + 1}/{len(segments)} segments")
-
-        # --- Continuity Metrics ---
-        short_segs = sum(1 for m in manifest if m["original_duration"] < 4.0 and not m["is_non_speech"])
-        ideal_segs = sum(1 for m in manifest if 8.0 <= m["original_duration"] <= 12.0)
-        total_speech = sum(1 for m in manifest if not m["is_non_speech"])
-        
-        # Penalize short segments and switches (switches is 0 in this architecture)
-        continuity_score = 100.0
-        if total_speech > 0:
-            continuity_score -= (short_segs / total_speech) * 40.0
-            continuity_score += (ideal_segs / total_speech) * 10.0
-        continuity_score = max(0.0, min(100.0, continuity_score))
-
-        LOG.info("=" * 60)
-        LOG.info("Voice Continuity Report")
-        LOG.info(f"  Total segments     : {len(segments)}")
-        LOG.info(f"  Short segments (<4s): {short_segs}")
-        LOG.info(f"  Ideal segments (8-12s): {ideal_segs}")
-        LOG.info(f"  Profile switches   : 0 (Architecture enforced)")
-        LOG.info(f"  Continuity Score   : {continuity_score:.1f}/100")
-        LOG.info("=" * 60)
 
         manifest_path = self.out_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))

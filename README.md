@@ -20,7 +20,6 @@ By default the dub script delivers the full dubbed video next to the input file.
 |---|---|
 | `--audio-only` | produce only `final_audio.wav` (no video remux) |
 | `--glossary PATH` | use a JSON glossary to prevent names/brands from being translated |
-| `--adapt-mode MODE`| set the persona (YouTube Narrator, Documentary, Podcast, Casual, News) |
 | `--no-cache` | force a complete rebuild by ignoring existing cache |
 | `--from-stage NAME` | reuse cache up to NAME, then rebuild everything after |
 
@@ -32,12 +31,11 @@ By default the dub script delivers the full dubbed video next to the input file.
 4. **Reference Sample Extraction** — Quality-based selection (8–12 s)
 5. **Speech Recognition** — faster-whisper (large-v3) with low-confidence re-verification
 6. **Translation** — `deep-translator` (Google → MyMemory fallback). Translation is dispatched through a pluggable `TranslationBackend` interface so future self-hosted models (NLLB, Marian, M2M100, Whisper) can be added without touching pipeline internals.
-7. **Speech Adaptation** — SmolLM2 (HuggingFaceTB/SmolLM2-1.7B-Instruct)
-8. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice)
-9. **Duration Alignment** — FFmpeg `atempo` (librosa fallback)
-10. **Timeline Reconstruction** — overlay + background mix
-11. **Final Mix** — FFmpeg with EBU R128 loudness normalization
-12. **Optional Video** — remux dubbed audio onto the original video
+7. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice)
+8. **Duration Alignment** — FFmpeg `atempo` (librosa fallback)
+9. **Timeline Reconstruction** — overlay + background mix
+10. **Final Mix** — FFmpeg with EBU R128 loudness normalization
+11. **Optional Video** — remux dubbed audio onto the original video
 
 ## Professional Dubbing Tips
 
@@ -46,9 +44,6 @@ To prevent characters or brands from being translated (e.g., "Ei Nerd" becoming 
 1. Generate a template: `./dub.sh glossary template --output entities.json`
 2. Add your terms to the JSON file.
 3. Run with: `./dub.sh input.mp4 pt en --glossary entities.json`
-
-### Tone and Personality
-Use `--adapt-mode` to match the style of the original content. The default "YouTube Narrator" is high-energy. For educational content, "Documentary" provides a calmer delivery.
 
 ## Requirements
 

@@ -76,7 +76,7 @@ class MixStage:
         return [self.output_dir / "final_audio.wav"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 10, 12, "Final Mix")
+        stage_banner(LOG, 9, 11, "Final Mix")
         speech_path = Path(context.get("reconstructed_path") or (self.workdir / "reconstructed_speech.wav"))
         background_path = Path(context.get("background_path") or (self.workdir / "background.wav"))
         if not speech_path.exists():

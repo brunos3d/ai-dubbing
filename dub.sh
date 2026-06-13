@@ -53,8 +53,6 @@ Primary Options:
   -t, --tgt-lang     Target language code (e.g. en, pt-BR, es).
   -o, --output-dir   Where to write final outputs (default: output/).
   --glossary PATH    JSON file for preserving names/brands from translation.
-  --adapt-mode MODE  Persona for speech refinement (default: "YouTube Narrator").
-                     Options: Documentary, Podcast, Casual, Interview, News.
   --no-cache         Ignore existing cache and rebuild from scratch.
   --from-stage NAME  Reuse cache up to NAME, then rebuild.
   --audio-only       Skip video remux; emit only final_audio.wav.
@@ -67,16 +65,9 @@ Manual & Tips for Professional Dubbing:
    $ [Edit entity_glossary.json with your terms]
    $ dub.sh input.mp4 pt en --glossary entity_glossary.json
 
-2. Speech Adaptation:
-   The --adapt-mode flag changes the tone of the translated speech. 
-   Use "YouTube Narrator" for high-energy creators and "Documentary" for 
-   calmer, more formal narration.
-
-3. Improving Quality:
+2. Improving Quality:
    - Use 'large-v3' (default) for transcription.
    - If audio is noisy, Demucs separation (automatic) will help.
-   - For single-narrator videos, 'Narrator Mode' activates automatically 
-     to ensure voice stability.
 
 Output detection:
   .mp4 / .mkv / .mov   full video

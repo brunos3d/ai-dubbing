@@ -1,95 +1,81 @@
-"""Utility for entity detection and preservation across transcription and translation."""
+"""Glossary-based entity preservation for translation.
+
+The only source of entity-preservation truth is the user-supplied
+glossary JSON.  No automatic entity detection runs.
+"""
 from __future__ import annotations
 
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
-
-from .logging import get_logger
-
-LOG = get_logger("ai-dubbing.entities")
+from typing import Any, Dict, Optional
 
 
 class EntityPreserver:
-    """Detects and preserves named entities using a glossary and heuristics."""
+    """Substitutes glossary terms with placeholders before translation,
+    then restores them after.
+
+    A glossary entry maps ``"Exact Term"`` to ``{"action": "preserve"}``.
+    Only the literal terms in the glossary are protected; no regex
+    heuristics, no sentence-capitalization guesses, no video-wide
+    vocabulary extraction.
+
+    When the glossary is empty (the common case), :meth:`protect` is a
+    no-op pass-through, and :meth:`restore` is a no-op pass-through. The
+    translator sees the original text verbatim.
+    """
 
     def __init__(self, glossary_path: Optional[Path] = None):
         self.glossary: Dict[str, Dict[str, Any]] = {}
         if glossary_path and glossary_path.exists():
             try:
                 self.glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
-                LOG.info(f"Loaded glossary with {len(self.glossary)} entities from {glossary_path}")
             except Exception as exc:
-                LOG.warning(f"Failed to load glossary: {exc}")
-        
+                # Bad glossary must not crash the pipeline.
+                self.glossary = {}
+                from .logging import get_logger
+                get_logger("ai-dubbing.entities").warning(
+                    f"Failed to load glossary {glossary_path}: {exc}"
+                )
+
+        self._loaded_count = len(self.glossary)
         self.placeholders: Dict[str, str] = {}
-        self.reverse_placeholders: Dict[str, str] = {}
 
-    def add_to_glossary(self, term: str, action: str = "preserve"):
+    @property
+    def is_active(self) -> bool:
+        """True when the glossary has at least one entry."""
+        return self._loaded_count > 0
+
+    def add_to_glossary(self, term: str, action: str = "preserve") -> None:
         self.glossary[term] = {"action": action}
-
-    def detect_entities(self, text: str) -> Set[str]:
-        """Heuristic detection of named entities (capitalized words, etc.)."""
-        # Look for sequences of capitalized words (2 or more)
-        # Or single capitalized words that are not at the start of a sentence.
-        entities = set()
-        
-        # Pattern for proper nouns (capitalized words not strictly at start of string)
-        # This is a basic heuristic.
-        words = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", text)
-        for w in words:
-            if len(w) > 2:
-                entities.add(w)
-        
-        # Add terms from glossary
-        for term in self.glossary:
-            if term.lower() in text.lower():
-                # Find exact casing if possible
-                match = re.search(re.escape(term), text, re.IGNORECASE)
-                if match:
-                    entities.add(match.group())
-                else:
-                    entities.add(term)
-        
-        return entities
+        self._loaded_count = len(self.glossary)
 
     def protect(self, text: str) -> str:
-        """Replace detected entities with placeholders to prevent translation."""
+        """Replace glossary terms with placeholders.
+
+        If the glossary is empty, returns ``text`` unchanged.
+        """
         self.placeholders = {}
-        self.reverse_placeholders = {}
-        
-        entities = self.detect_entities(text)
-        # Sort by length descending to avoid partial matches
-        sorted_entities = sorted(list(entities), key=len, reverse=True)
-        
-        protected_text = text
-        for i, ent in enumerate(sorted_entities):
+        if not self.is_active:
+            return text
+
+        protected = text
+        # Sort by length descending so multi-word terms win over their
+        # sub-phrases (e.g. "Peter Parker" before "Peter").
+        for i, term in enumerate(sorted(self.glossary.keys(), key=len, reverse=True)):
             placeholder = f"__ENT_{i}__"
-            self.placeholders[placeholder] = ent
-            self.reverse_placeholders[ent] = placeholder
-            # Use regex with word boundaries to replace
-            protected_text = re.sub(r"\b" + re.escape(ent) + r"\b", placeholder, protected_text)
-            
-        return protected_text
+            self.placeholders[placeholder] = term
+            pattern = re.compile(re.escape(term), re.IGNORECASE)
+            protected = pattern.sub(placeholder, protected)
+        return protected
 
     def restore(self, text: str) -> str:
-        """Restore entities from placeholders after translation."""
-        restored_text = text
+        """Replace placeholders with the original glossary terms.
+
+        If the glossary was empty, returns ``text`` unchanged.
+        """
+        if not self.placeholders:
+            return text
         for placeholder, original in self.placeholders.items():
-            restored_text = restored_text.replace(placeholder, original)
-        return restored_text
-
-
-def build_video_vocabulary(segments: List[Dict[str, Any]]) -> Set[str]:
-    """Build a set of frequently occurring capitalized terms across the video."""
-    all_text = " ".join(s.get("text", "") for s in segments)
-    # Count occurrences of capitalized phrases
-    candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", all_text)
-    counts = {}
-    for c in candidates:
-        counts[c] = counts.get(c, 0) + 1
-    
-    # Keep terms that appear multiple times or are in a known glossary
-    # (Simplified for now: keep all with > 1 occurrence)
-    return {c for c, count in counts.items() if count > 1 and len(c) > 3}
+            text = text.replace(placeholder, original)
+        return text
