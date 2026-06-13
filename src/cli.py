@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -33,6 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--whisper-model", default="large-v3", help="faster-whisper model size")
     run_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
     run_p.add_argument("--target-lufs", type=float, default=-16.0, help="Loudness target for final mix")
+    run_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
+    run_p.add_argument("--adapt-model", default="HuggingFaceTB/SmolLM2-1.7B-Instruct", help="Model for speech adaptation")
+    run_p.add_argument("--adapt-mode", default="YouTube Narrator", help="Adaptation persona (e.g. YouTube Narrator, Documentary, Casual)")
     run_p.add_argument("--start-from", default="extract", help="Stage to start from (for resuming)")
     run_p.add_argument("--only", default=None, help="Run only a single stage (debug)")
     
@@ -66,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     cache_sub.add_parser("list", help="List all cache entries")
     cache_sub.add_parser("prune", help="Remove stale cache entries")
     cache_sub.add_parser("clear", help="Remove all cache entries")
+
+    # Glossary Management
+    gloss_p = subparsers.add_parser("glossary", help="Manage entity glossaries")
+    gloss_sub = gloss_p.add_subparsers(dest="glossary_command", required=True)
+    gloss_tmpl = gloss_sub.add_parser("template", help="Generate a glossary template")
+    gloss_tmpl.add_argument("--output", "-o", default="entity_glossary.json", help="Where to save the template")
 
     return p
 
@@ -122,12 +132,31 @@ def handle_cache(args):
         print(f"Cleared all {count} cache entries.")
 
 
+def handle_glossary(args):
+    if args.glossary_command == "template":
+        template = {
+            "Ei Nerd": {"action": "preserve"},
+            "Spider-Man": {"action": "preserve"},
+            "Hulk": {"action": "preserve"},
+            "Marvel": {"action": "preserve"},
+            "Peter Parker": {"action": "preserve"},
+            "Tokeniza": {"action": "preserve"},
+            "Mister Negative": {"action": "preserve"},
+            "Kurzgesagt": {"action": "preserve"},
+            "YouTube": {"action": "preserve"},
+            "Gemini": {"action": "preserve"}
+        }
+        out_path = Path(args.output)
+        out_path.write_text(json.dumps(template, indent=2, ensure_ascii=False))
+        print(f"Generated glossary template: {out_path}")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # Pre-process argv to inject 'run' if no subcommand is present
     if argv is None:
         argv = sys.argv[1:]
     
-    if argv and argv[0] not in ("run", "cache", "-h", "--help"):
+    if argv and argv[0] not in ("run", "cache", "glossary", "-h", "--help"):
         argv = ["run"] + argv
     elif not argv:
         argv = ["--help"]
@@ -137,6 +166,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "cache":
         handle_cache(args)
+        return 0
+
+    if args.command == "glossary":
+        handle_glossary(args)
         return 0
 
     if not Path(args.input).exists():
@@ -160,6 +193,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         no_cache=args.no_cache,
         from_stage=args.from_stage,
         read_only_cache=args.read_only_cache,
+        adapt_model=args.adapt_model,
+        adapt_mode=args.adapt_mode,
+        glossary_path=Path(args.glossary).resolve() if args.glossary else None,
     )
     try:
         pipeline.run(start_from=args.start_from, only=args.only)

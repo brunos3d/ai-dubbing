@@ -170,9 +170,9 @@ class GenerateStage:
         )
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 6, 11, "OmniVoice Generation")
+        stage_banner(LOG, 7, 12, "OmniVoice Generation") # Updated total stages
 
-        translated_path = Path(context["translated_path"])
+        transcript_path = Path(context.get("use_transcript_path", context["translated_path"]))
         speech_path = Path(context["speech_path"])
         full_audio, full_sr = read_wav(speech_path)
         if full_audio.ndim == 2:

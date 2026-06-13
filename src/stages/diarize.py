@@ -312,7 +312,7 @@ class DiarizeStage:
         return [self.workdir / "segments.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 2, 11, "Pyannote Diarization")
+        stage_banner(LOG, 2, 12, "Pyannote Diarization")
         speech_path = Path(context["speech_path"])
         if not speech_path.exists():
             raise FileNotFoundError(speech_path)

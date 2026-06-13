@@ -9,36 +9,46 @@ preserving the original speakers' voices, pacing, ambience, music and effects.
 ```bash
 ./dub.sh input/video.mp4 pt en                  # pt -> en; default: full video
 ./dub.sh input/video.mp4 en pt-BR --audio-only  # only the dubbed audio
-./dub.sh input/song.mp3 en es --emit=audio      # explicit audio-only
-python main.py -i input.mp4 -s en -t es         # direct CLI access
+./dub.sh input/video.mp4 pt en --glossary g.json # preserve entities
+./dub.sh cache clear                            # clear all artifacts
+./dub.sh glossary template                      # create a glossary file
 ```
 
-By default the dub script delivers the full dubbed video at
-`output/final_video.mp4` (and the standalone `output/final_audio.wav` as a
-byproduct). Use a flag to take only the audio:
+By default the dub script delivers the full dubbed video next to the input file. Use flags to control the output and behavior:
 
 | Flag | Effect |
 |---|---|
-| *(default)* | produce both `final_audio.wav` and `final_video.mp4` |
 | `--audio-only` | produce only `final_audio.wav` (no video remux) |
-| `--emit=audio` | same as `--audio-only` |
-| `--emit=video` | produce only the video (audio file still written) |
-| `--emit=both` | same as default |
-| `-- --whisper-model=medium` | forward any `main.py` flag through the wrapper |
+| `--glossary PATH` | use a JSON glossary to prevent names/brands from being translated |
+| `--adapt-mode MODE`| set the persona (YouTube Narrator, Documentary, Podcast, Casual, News) |
+| `--no-cache` | force a complete rebuild by ignoring existing cache |
+| `--from-stage NAME` | reuse cache up to NAME, then rebuild everything after |
 
 ## Pipeline
 
 1. **Audio Extraction** — FFmpeg
 2. **Source Separation** — Demucs (htdemucs)
-3. **Speaker Diarization** — pyannote.audio (with VAD + MFCC clustering fallback)
-4. **Reference Sample Extraction** — clean 5–10 s clips per speaker
-5. **Speech Recognition** — faster-whisper (large-v3)
-6. **Translation** — Google / MyMemory via deep-translator
-7. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice)
-8. **Duration Alignment** — FFmpeg `atempo` (librosa fallback)
-9. **Timeline Reconstruction** — overlay + background mix
-10. **Final Mix** — FFmpeg with EBU R128 loudness normalization
-11. **Optional Video** — remux dubbed audio onto the original video
+3. **Speaker Diarization** — pyannote.audio
+4. **Reference Sample Extraction** — Quality-based selection (8–12 s)
+5. **Speech Recognition** — faster-whisper (large-v3) with low-confidence re-verification
+6. **Translation** — NLLB-200 (facebook/nllb-200-distilled-600M)
+7. **Speech Adaptation** — SmolLM2 (HuggingFaceTB/SmolLM2-1.7B-Instruct)
+8. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice)
+9. **Duration Alignment** — FFmpeg `atempo` (librosa fallback)
+10. **Timeline Reconstruction** — overlay + background mix
+11. **Final Mix** — FFmpeg with EBU R128 loudness normalization
+12. **Optional Video** — remux dubbed audio onto the original video
+
+## Professional Dubbing Tips
+
+### Named Entity Preservation
+To prevent characters or brands from being translated (e.g., "Ei Nerd" becoming "Hey Nerd"), use a glossary:
+1. Generate a template: `./dub.sh glossary template --output entities.json`
+2. Add your terms to the JSON file.
+3. Run with: `./dub.sh input.mp4 pt en --glossary entities.json`
+
+### Tone and Personality
+Use `--adapt-mode` to match the style of the original content. The default "YouTube Narrator" is high-energy. For educational content, "Documentary" provides a calmer delivery.
 
 ## Requirements
 

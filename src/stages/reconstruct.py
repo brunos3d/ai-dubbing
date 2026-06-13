@@ -149,7 +149,7 @@ class ReconstructStage:
         return [self.output_dir / "reconstructed_speech.wav"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 8, 11, "Reconstruction")
+        stage_banner(LOG, 9, 12, "Reconstruction")
         aligned_manifest_path = Path(context["manifest_path"])
         background_path = Path(context["background_path"])
         LOG.info(f"Reading aligned manifest from {aligned_manifest_path}")

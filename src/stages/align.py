@@ -158,7 +158,7 @@ class AlignStage:
         return [self.out_dir, self.workdir / "aligned_manifest.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 7, 11, "Duration Alignment")
+        stage_banner(LOG, 8, 12, "Duration Alignment")
         generated_dir = Path(context["generated_dir"])
         manifest_path = Path(context["manifest_path"])
         samples_map: Dict[str, str] = context.get("speaker_samples", {})

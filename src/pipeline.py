@@ -17,6 +17,7 @@ from .stages import (
     SampleStage,
     SeparateStage,
     TranslateStage,
+    AdaptStage,
     TranscribeStage,
     VideoStage,
 )
@@ -38,6 +39,7 @@ class Pipeline:
         ("samples", SampleStage),
         ("transcribe", TranscribeStage),
         ("translate", TranslateStage),
+        ("adapt", AdaptStage),
         ("generate", GenerateStage),
         ("align", AlignStage),
         ("reconstruct", ReconstructStage),
@@ -59,6 +61,9 @@ class Pipeline:
         no_cache: bool = False,
         from_stage: Optional[str] = None,
         read_only_cache: bool = False,
+        adapt_model: str = "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+        adapt_mode: str = "YouTube Narrator",
+        glossary_path: Optional[Path] = None,
     ):
         global LOG
         env()
@@ -73,6 +78,9 @@ class Pipeline:
         self.no_cache = no_cache
         self.from_stage = from_stage
         self.read_only_cache = read_only_cache
+        self.adapt_model = adapt_model
+        self.adapt_mode = adapt_mode
+        self.glossary_path = glossary_path
 
         # Cache resolution
         self.cache_manager = CacheManager()
@@ -146,7 +154,9 @@ class Pipeline:
         if name == "transcribe":
             return TranscribeStage(self.workdir, model_size=self.whisper_model, source_language=self.source_language)
         if name == "translate":
-            return TranslateStage(self.workdir, self.source_language, self.target_language)
+            return TranslateStage(self.workdir, self.source_language, self.target_language, glossary_path=self.glossary_path)
+        if name == "adapt":
+            return AdaptStage(self.workdir, model_id=self.adapt_model, mode=self.adapt_mode)
         if name == "generate":
             return GenerateStage(self.workdir, target_language=self.target_language)
         if name == "align":
@@ -268,10 +278,16 @@ class Pipeline:
         context["segments_path"] = str(workdir / "segments.json")
         context["transcript_path"] = str(workdir / "transcript.json")
         context["translated_path"] = str(workdir / "translated_transcript.json")
+        context["adapted_path"] = str(workdir / "adapted_transcript.json")
         context["generated_dir"] = str(workdir / "generated_segments")
         context["manifest_path"] = str(
             workdir / "generated_segments" / "manifest.json"
         )
+        # Use adapted transcript if it exists, otherwise fall back to translated
+        if (workdir / "adapted_transcript.json").exists():
+            context["use_transcript_path"] = context["adapted_path"]
+        else:
+            context["use_transcript_path"] = context["translated_path"]
         context["aligned_dir"] = str(workdir / "aligned_segments")
         aligned_manifest = str(workdir / "aligned_manifest.json")
         context["aligned_manifest"] = aligned_manifest
@@ -329,6 +345,10 @@ class Pipeline:
             context["word_path"] = result.get("word_path", str(self.workdir / "transcript_word_level.json"))
         elif name == "translate":
             context["translated_path"] = result.get("translated_path") or str(self.workdir / "translated_transcript.json")
+            context["use_transcript_path"] = context["translated_path"]
+        elif name == "adapt":
+            context["adapted_path"] = result.get("adapted_path") or str(self.workdir / "adapted_transcript.json")
+            context["use_transcript_path"] = context["adapted_path"]
         elif name == "generate":
             context["generated_dir"] = result.get("generated_dir", str(self.workdir / "generated_segments"))
             context["manifest_path"] = result.get("manifest_path", str(self.workdir / "generated_segments" / "manifest.json"))

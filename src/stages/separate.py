@@ -111,7 +111,7 @@ class SeparateStage:
         return [self.workdir / "speech.wav", self.workdir / "background.wav"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 1, 11, "Demucs Separation")
+        stage_banner(LOG, 1, 12, "Demucs Separation")
         audio_path = Path(context["audio_path"])
         if not audio_path.exists():
             raise FileNotFoundError(f"audio not found: {audio_path}")

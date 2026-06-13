@@ -52,7 +52,7 @@ class VideoStage:
         return [self.output_dir / "final_video.mp4"]
 
     def run(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        stage_banner(LOG, 10, 11, "Optional Video")
+        stage_banner(LOG, 11, 12, "Optional Video")
         if not self.input_path.exists():
             LOG.warning("Original media missing; skipping video output")
             return None

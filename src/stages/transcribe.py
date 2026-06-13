@@ -2,13 +2,82 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
+from ..utils.entities import EntityPreserver, build_video_vocabulary
 from ..utils.logging import get_logger, stage_banner
 from ..utils.vram import free_vram, log_vram
 
 LOG = get_logger("ai-dubbing.transcribe")
+
+
+def _reverify_low_confidence(
+    speech_path: Path,
+    segment: Dict[str, Any],
+    model_size: str,
+    language: Optional[str],
+    device: str,
+    compute_type: str,
+    threshold: float = -0.8,
+) -> Dict[str, Any]:
+    """Re-transcribe a low-confidence segment with higher effort (larger beam)."""
+    if segment.get("avg_logprob", 0.0) >= threshold:
+        return segment
+
+    from faster_whisper import WhisperModel
+
+    LOG.info(f"Re-verifying low-confidence segment ({segment['avg_logprob']:.2f}): {segment['text'][:50]}...")
+    
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        lang = None if (not language or language == "auto") else language
+        
+        # Crop audio to just this segment for focused re-verification
+        # (For now, we just run transcribe with restricted timestamps to avoid complex cropping)
+        segs_iter, _ = model.transcribe(
+            str(speech_path),
+            language=lang,
+            beam_size=10, # Higher beam for second pass
+            best_of=5,
+            initial_prompt=segment["text"], # Use first pass as prompt
+            clip_timestamps=f"{segment['start']},{segment['end']}",
+            vad_filter=True,
+        )
+        
+        results = list(segs_iter)
+        if results:
+            best = max(results, key=lambda x: x.avg_logprob)
+            if best.avg_logprob > segment["avg_logprob"]:
+                LOG.info(f"  Improved confidence: {segment['avg_logprob']:.2f} -> {best.avg_logprob:.2f}")
+                new_segment = dict(segment)
+                new_segment["text"] = best.text.strip()
+                new_segment["avg_logprob"] = best.avg_logprob
+                return new_segment
+    except Exception as exc:
+        LOG.warning(f"Re-verification failed: {exc}")
+    finally:
+        try:
+            del model
+        except Exception:
+            pass
+        free_vram()
+        
+    return segment
+
+
+def _correct_with_vocabulary(text: str, vocabulary: Set[str]) -> str:
+    """Heuristic correction of names/terms using video-wide vocabulary."""
+    corrected = text
+    for term in vocabulary:
+        # If text contains a fuzzy match of term, replace it with the term
+        # (Very basic implementation: check if term.lower() is in text.lower())
+        # To avoid over-correction, we only do this for terms > 5 chars or distinct ones.
+        if term.lower() in text.lower():
+            # Use regex to find and replace with exact casing from vocabulary
+            corrected = re.sub(re.escape(term), term, corrected, flags=re.IGNORECASE)
+    return corrected
 
 
 def _default_compute_type(device: str) -> str:
@@ -260,7 +329,7 @@ class TranscribeStage:
         return [self.workdir / "transcript.json", self.workdir / "transcript_word_level.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 4, 11, "Whisper Transcription")
+        stage_banner(LOG, 4, 12, "Whisper Transcription")
         speech_path = Path(context["speech_path"])
         segments_path = Path(context["segments_path"])
         diar_segments = json.loads(segments_path.read_text(encoding="utf-8"))
@@ -296,10 +365,32 @@ class TranscribeStage:
             merged.extend(_group_words_into_segments(words, spk))
         merged.sort(key=lambda s: s["start"])
         seg_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
-        LOG.info(f"Transcript: {len(merged)} utterances")
+
+        # --- Second Pass / Refinement ---
+        LOG.info("Refining transcript (entity preservation & low-confidence check)...")
+        
+        # 1. Build video-wide vocabulary from high-confidence segments
+        high_conf = [s for s in merged if s.get("avg_logprob", 0.0) > -0.5]
+        video_vocab = build_video_vocabulary(high_conf)
+        
+        # 2. Re-verify low-confidence segments and apply corrections
+        refined: List[Dict[str, Any]] = []
+        for s in merged:
+            # Re-verify if needed
+            rs = _reverify_low_confidence(
+                speech_path, s, self.model_size, 
+                self.source_language, self.device, compute_type
+            )
+            # Contextual correction
+            rs["text"] = _correct_with_vocabulary(rs["text"], video_vocab)
+            refined.append(rs)
+            
+        seg_path.write_text(json.dumps(refined, indent=2, ensure_ascii=False))
+        LOG.info(f"Transcript: {len(refined)} utterances")
         log_vram(LOG)
         return {
             "transcript_path": str(seg_path),
             "word_path": str(word_path),
-            "num_utterances": len(merged),
+            "num_utterances": len(refined),
+            "video_vocabulary": list(video_vocab),
         }

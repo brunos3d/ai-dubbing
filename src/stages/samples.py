@@ -279,7 +279,7 @@ class SampleStage:
         return [self.workdir / "speaker_profiles", self.workdir / "speakers"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 3, 11, "Sample Extraction")
+        stage_banner(LOG, 3, 12, "Sample Extraction")
         speech_path = Path(context["speech_path"])
         segments_path = Path(context["segments_path"])
         source_language = context.get("source_language")

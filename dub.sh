@@ -32,22 +32,53 @@ cd "$SCRIPT_DIR"
 
 print_usage() {
     cat <<'EOF'
-dub.sh - ffmpeg-style multilingual dubbing pipeline
+ai-dubbing: Local-first multilingual dubbing pipeline
 
-  dub.sh <input> <source-language> <target-language> [output-file] [options]
+Usage:
+  dub.sh <input> <src-lang> <tgt-lang> [output] [options]
+  dub.sh cache <command>
+  dub.sh glossary <command>
 
-Examples:
-  dub.sh video.mp4 pt en                       # -> ./video-dub-en.mp4
-  dub.sh /data/in.mp4 pt en ~/dubbed.mp4      # -> ~/dubbed.mp4
-  dub.sh podcast.mp3 en es out.mp3            # -> ./out.mp3
-  dub.sh video.mp4 pt en -- --whisper-model=medium
+Commands:
+  run (default)      Execute the dubbing pipeline on an input file.
+  cache info         Show aggregate cache statistics.
+  cache list         List all cached pipeline runs.
+  cache prune        Remove stale cache entries (>7 days old).
+  cache clear        Remove all cached artifacts.
+  glossary template  Generate a sample entity_glossary.json.
 
-Output path:
-  4th positional arg   explicit output file (extension drives audio/video)
-  (omitted)             <input-stem>-dub-<tgt>.<input-ext> next to the input
-  existing target       auto-incremented with -(1), -(2), ...
+Primary Options:
+  -i, --input        Path to input media (mp4/mkv/mov/mp3/wav/flac).
+  -s, --src-lang     Source language code (e.g. en, pt, ru).
+  -t, --tgt-lang     Target language code (e.g. en, pt-BR, es).
+  -o, --output-dir   Where to write final outputs (default: output/).
+  --glossary PATH    JSON file for preserving names/brands from translation.
+  --adapt-mode MODE  Persona for speech refinement (default: "YouTube Narrator").
+                     Options: Documentary, Podcast, Casual, Interview, News.
+  --no-cache         Ignore existing cache and rebuild from scratch.
+  --from-stage NAME  Reuse cache up to NAME, then rebuild.
+  --audio-only       Skip video remux; emit only final_audio.wav.
 
-Format:
+Manual & Tips for Professional Dubbing:
+
+1. Named Entity Preservation:
+   If names like "Ei Nerd" or "Marvel" are being translated, use a glossary:
+   $ dub.sh glossary template
+   $ [Edit entity_glossary.json with your terms]
+   $ dub.sh input.mp4 pt en --glossary entity_glossary.json
+
+2. Speech Adaptation:
+   The --adapt-mode flag changes the tone of the translated speech. 
+   Use "YouTube Narrator" for high-energy creators and "Documentary" for 
+   calmer, more formal narration.
+
+3. Improving Quality:
+   - Use 'large-v3' (default) for transcription.
+   - If audio is noisy, Demucs separation (automatic) will help.
+   - For single-narrator videos, 'Narrator Mode' activates automatically 
+     to ensure voice stability.
+
+Output detection:
   .mp4 / .mkv / .mov   full video
   .wav / .mp3 / .flac  audio only
   Override via --audio-only / --emit=audio|video|both
@@ -72,6 +103,16 @@ if [[ "${1:-}" == "cache" ]]; then
         PYTHON_BIN="$(command -v python3)"
     fi
     "$PYTHON_BIN" main.py cache "${@:2}"
+    exit 0
+fi
+
+# Handle glossary subcommand
+if [[ "${1:-}" == "glossary" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        PYTHON_BIN="$(command -v python3)"
+    fi
+    "$PYTHON_BIN" main.py glossary "${@:2}"
     exit 0
 fi
 
@@ -103,10 +144,37 @@ for arg in "$@"; do
 done
 
 # First non-flag pre-dash arg = explicit output path; the rest are flags
-# we forward to main.py.
+# we forward to main.py. Flags that take a value consume the next arg so
+# it isn't mistaken for the output path.
 EXPLICIT_OUTPUT=""
 MAIN_FLAGS=()
+SKIP_NEXT=0
+# Flags that take a value (consumes the next arg as that value).
+VALUE_FLAGS=(
+    --glossary --adapt-model --adapt-mode --whisper-model --target-lufs
+    --hf-token --workdir --output-dir --start-from --only --from-stage
+    --emit -o
+)
+is_value_flag() {
+    local flag="$1"
+    for vf in "${VALUE_FLAGS[@]}"; do
+        if [[ "$flag" == "$vf" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
 for arg in "${PRE_DASH[@]+"${PRE_DASH[@]}"}"; do
+    if [[ $SKIP_NEXT -eq 1 ]]; then
+        MAIN_FLAGS+=("$arg")
+        SKIP_NEXT=0
+        continue
+    fi
+    if is_value_flag "$arg"; then
+        MAIN_FLAGS+=("$arg")
+        SKIP_NEXT=1
+        continue
+    fi
     if [[ -z "$EXPLICIT_OUTPUT" && "$arg" != -* && -n "$arg" ]]; then
         EXPLICIT_OUTPUT="$arg"
     else
