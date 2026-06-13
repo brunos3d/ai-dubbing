@@ -11,7 +11,9 @@ from typing import List, Optional
 from .pipeline import Pipeline
 from .utils.cache import CacheManager
 from .utils.paths import project_root
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def _str2bool(value: str) -> bool:
     return str(value).lower() in {"1", "true", "yes", "y"}
@@ -42,6 +44,14 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--no-cache", action="store_true", help="Force rebuild from scratch")
     run_p.add_argument("--from-stage", help="Rebuild everything from the specified stage onwards")
     run_p.add_argument("--read-only-cache", action="store_true", help="Do not write new data to the cache")
+    run_p.add_argument(
+        "--no-pyannote",
+        action="store_true",
+        help="Opt out of pyannote diarization and use the VAD+MFCC "
+        "clustering fallback.  Pyannote is the default; this flag "
+        "is only needed when pyannote is unavailable (e.g. the HF "
+        "account has not been granted access to the gated models).",
+    )
 
     out = run_p.add_argument_group("output formats (default: produce the full dubbed video)")
     out.add_argument(
@@ -192,6 +202,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         from_stage=args.from_stage,
         read_only_cache=args.read_only_cache,
         glossary_path=Path(args.glossary).resolve() if args.glossary else None,
+        no_pyannote=args.no_pyannote,
     )
     try:
         pipeline.run(start_from=args.start_from, only=args.only)

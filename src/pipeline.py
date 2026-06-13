@@ -60,6 +60,7 @@ class Pipeline:
         from_stage: Optional[str] = None,
         read_only_cache: bool = False,
         glossary_path: Optional[Path] = None,
+        no_pyannote: bool = False,
     ):
         global LOG
         env()
@@ -75,6 +76,7 @@ class Pipeline:
         self.from_stage = from_stage
         self.read_only_cache = read_only_cache
         self.glossary_path = glossary_path
+        self.no_pyannote = no_pyannote
 
         # Cache resolution
         self.cache_manager = CacheManager()
@@ -142,7 +144,7 @@ class Pipeline:
         if name == "separate":
             return SeparateStage(self.workdir)
         if name == "diarize":
-            return DiarizeStage(self.workdir, hf_token=self.hf_token)
+            return DiarizeStage(self.workdir, hf_token=self.hf_token, no_pyannote=self.no_pyannote)
         if name == "samples":
             return SampleStage(self.workdir)
         if name == "transcribe":

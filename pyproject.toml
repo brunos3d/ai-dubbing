@@ -10,7 +10,12 @@ dependencies = [
     "numpy>=1.26",
     # Demucs (uses torchaudio)
     "demucs>=4.0.1",
-    # Pyannote.audio (diarization)
+    # Pyannote.audio (diarization) - default diarizer.
+    # The HF account that owns HF_TOKEN must have accepted the gating
+    # terms for pyannote/segmentation-3.0 and pyannote/speaker-diarization-3.1
+    # at https://huggingface.co/pyannote/segmentation-3.0 and
+    # https://huggingface.co/pyannote/speaker-diarization-3.1 respectively.
+    # Run `python scripts/test_pyannote_auth.py` to verify access.
     "pyannote.audio>=3.1",
     # faster-whisper (ASR)
     "faster-whisper>=1.0.0",
@@ -22,12 +27,24 @@ dependencies = [
     "tqdm>=4.66",
     "rich>=13.7",
     "pyyaml>=6.0",
+    # Environment loading
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 torch-cuda = [
     "torch==2.8.0",
     "torchaudio==2.8.0",
+    # torchcodec is pulled in transitively by pyannote.audio for its
+    # built-in audio decoder.  It is NOT required by the pipeline
+    # because the diarize stage pre-loads audio with soundfile and
+    # hands the pipeline a ``{"waveform": tensor, "sample_rate": int}``
+    # dict, which is exactly the fallback pyannote.audio recommends
+    # when torchcodec cannot load.  The import-time
+    # ``torch_from_blob`` / ``libavutil.so.5x`` warnings can therefore
+    # be safely ignored.  Pin a specific torchcodec only if you want
+    # to silence them; the wheel must match the installed torch and
+    # ffmpeg versions (e.g. torchcodec==0.7 for torch 2.8 + ffmpeg 6/7).
 ]
 
 [project.scripts]

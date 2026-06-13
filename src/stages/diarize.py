@@ -2,11 +2,16 @@
 
 Primary: pyannote.audio (requires ``HF_TOKEN`` to access the gated models).
 Fallback: VAD + MFCC clustering using Silero VAD, which is fully open.
+
+The HF_TOKEN must belong to a user who has accepted the gating terms for
+``pyannote/segmentation-3.0`` *and* ``pyannote/speaker-diarization-3.1``;
+see :mod:`scripts.test_pyannote_auth` for a standalone probe.
 """
 from __future__ import annotations
 
 import json
 import os
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,18 +24,47 @@ from ..utils.vram import free_vram, log_vram
 LOG = get_logger("ai-dubbing.diarize")
 
 
+def _resolve_hf_token(hf_token: Optional[str]) -> Optional[str]:
+    """Return the first non-empty HF_TOKEN source we can find."""
+    if hf_token:
+        return hf_token
+    env_tok = os.environ.get("HF_TOKEN")
+    if env_tok:
+        return env_tok
+    return None
+
+
+def _log_token_diagnostics(hf_token: Optional[str]) -> None:
+    """Emit non-secret diagnostics about how the token was resolved."""
+    resolved = _resolve_hf_token(hf_token)
+    if resolved:
+        masked = f"{resolved[:3]}...{resolved[-3:]} (len={len(resolved)})"
+        LOG.info(f"HF_TOKEN loaded: True ({masked})")
+    else:
+        LOG.warning("HF_TOKEN loaded: False (no token in args or environment)")
+    LOG.info("Pyannote auth mode: token= keyword (pyannote.audio >= 4.0)")
+
+
 def _have_pyannote_auth(hf_token: Optional[str]) -> bool:
-    return bool(hf_token or os.environ.get("HF_TOKEN"))
+    return _resolve_hf_token(hf_token) is not None
 
 
 def _make_pipeline(model_id: str, hf_token: Optional[str]):
+    """Load a pyannote pipeline, preferring the modern ``token=`` kwarg.
+
+    pyannote.audio 4.x removed ``use_auth_token=``; the 3.x name is still
+    accepted by some releases.  We try the modern name first, then fall
+    back for the 3.x line, and finally pass nothing so huggingface_hub
+    can pick up the token from the ``HF_TOKEN`` environment variable.
+    """
     from pyannote.audio import Pipeline
 
-    use_auth = hf_token or os.environ.get("HF_TOKEN")
+    token = _resolve_hf_token(hf_token)
     try:
-        return Pipeline.from_pretrained(model_id, use_auth_token=use_auth)
+        return Pipeline.from_pretrained(model_id, token=token)
     except TypeError:
-        return Pipeline.from_pretrained(model_id, token=use_auth)
+        # pyannote.audio 3.x - the keyword was ``use_auth_token``.
+        return Pipeline.from_pretrained(model_id, use_auth_token=token)
 
 
 def _annotation_to_segments(annotation, min_duration: float = 0.3) -> List[Dict[str, Any]]:
@@ -299,6 +333,7 @@ class DiarizeStage:
         max_speakers: Optional[int] = None,
         device: str = "cuda",
         fallback_num_speakers: int = 2,
+        no_pyannote: bool = False,
     ):
         self.workdir = Path(workdir)
         self.hf_token = hf_token
@@ -307,6 +342,9 @@ class DiarizeStage:
         self.max_speakers = max_speakers
         self.device = device
         self.fallback_num_speakers = fallback_num_speakers
+        # When True, skip pyannote entirely and use the VAD+MFCC fallback.
+        # Pyannote is the default diarizer - opting out must be explicit.
+        self.no_pyannote = no_pyannote
 
     def outputs(self) -> List[Path]:
         return [self.workdir / "segments.json"]
@@ -324,44 +362,70 @@ class DiarizeStage:
         else:
             mono = waveform
 
-        if _have_pyannote_auth(self.hf_token):
+        _log_token_diagnostics(self.hf_token)
+
+        if self.no_pyannote:
+            LOG.info("--no-pyannote set; using VAD + MFCC clustering fallback")
+        elif _have_pyannote_auth(self.hf_token):
             try:
                 pipeline = _make_pipeline(self.model_id, self.hf_token)
-                if pipeline is not None:
-                    import torch
+                if pipeline is None:
+                    raise RuntimeError(
+                        "Pipeline.from_pretrained returned None - the token "
+                        "is valid but the user has not been granted "
+                        "access to the gated pyannote models.  Visit "
+                        "https://huggingface.co/pyannote/segmentation-3.0 "
+                        "and https://huggingface.co/pyannote/speaker-diarization-3.1 "
+                        "to accept the user conditions."
+                    )
+                import torch
 
-                    pipeline.to(torch.device(self.device))
-                    audio_in = {
-                        "waveform": torch.from_numpy(mono).float(),
-                        "sample_rate": sr,
-                    }
-                    kwargs: Dict[str, Any] = {}
-                    if self.min_speakers is not None:
-                        kwargs["min_speakers"] = self.min_speakers
-                    if self.max_speakers is not None:
-                        kwargs["max_speakers"] = self.max_speakers
-                    diarization = pipeline(audio_in, **kwargs)
-                    raw_segments = _annotation_to_segments(diarization)
-                    merged_segments = _merge_tiny_speakers(raw_segments)
-                    segments = _relabel_speakers(merged_segments)
-                    try:
-                        del pipeline
-                    except Exception:
-                        pass
-                    free_vram()
-                    speakers = sorted({s["speaker"] for s in segments})
-                    LOG.info(f"Pyannote: {len(speakers)} speakers / {len(segments)} segments")
-                    out_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False))
-                    return {
-                        "segments_path": str(out_path),
-                        "speakers": speakers,
-                        "num_segments": len(segments),
-                    }
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(f"pyannote diarization failed ({exc}); using VAD+clustering fallback")
+                pipeline.to(torch.device(self.device))
+                audio_in = {
+                    "waveform": torch.from_numpy(mono).float(),
+                    "sample_rate": sr,
+                }
+                kwargs: Dict[str, Any] = {}
+                if self.min_speakers is not None:
+                    kwargs["min_speakers"] = self.min_speakers
+                if self.max_speakers is not None:
+                    kwargs["max_speakers"] = self.max_speakers
+                diarization = pipeline(audio_in, **kwargs)
+                raw_segments = _annotation_to_segments(diarization)
+                merged_segments = _merge_tiny_speakers(raw_segments)
+                segments = _relabel_speakers(merged_segments)
+                try:
+                    del pipeline
+                except Exception:
+                    pass
                 free_vram()
+                speakers = sorted({s["speaker"] for s in segments})
+                LOG.info(f"Detected speakers: {len(speakers)}")
+                LOG.info(f"Pyannote: {len(speakers)} speakers / {len(segments)} segments")
+                out_path.write_text(json.dumps(segments, indent=2, ensure_ascii=False))
+                return {
+                    "segments_path": str(out_path),
+                    "speakers": speakers,
+                    "num_segments": len(segments),
+                }
+            except Exception as exc:  # noqa: BLE001
+                LOG.error(f"pyannote diarization failed: {type(exc).__name__}: {exc}")
+                LOG.debug(traceback.format_exc())
+                raise RuntimeError(
+                    "Pyannote diarization failed and no fallback is allowed "
+                    "(default behaviour).  Re-run with --no-pyannote to opt "
+                    "out of pyannote and use the VAD+MFCC clustering "
+                    "fallback, or fix the underlying error above."
+                ) from exc
         else:
-            LOG.info("No HF_TOKEN; using VAD + MFCC clustering diarization")
+            raise RuntimeError(
+                "HF_TOKEN is not set but pyannote is the default diarizer.  "
+                "Either set HF_TOKEN in .env (the token must belong to a "
+                "Hugging Face account that has accepted the gating terms "
+                "for pyannote/segmentation-3.0 and "
+                "pyannote/speaker-diarization-3.1) or re-run with "
+                "--no-pyannote to use the VAD+MFCC clustering fallback."
+            )
 
         # If the user did not pin min/max speakers, let the clusterer
         # auto-detect.  Otherwise respect the user-provided range.

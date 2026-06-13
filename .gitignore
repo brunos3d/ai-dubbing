@@ -167,3 +167,10 @@ htmlcov/
 *.prof
 *.lprof
 .ipynb_checkpoints/
+
+# -----------------------------------------------------------------------------
+# Environment variables (never commit .env with secrets, but allow .env.example)
+# -----------------------------------------------------------------------------
+# The .env file contains sensitive information like API keys and should not be committed.
+.env*
+!.env.example

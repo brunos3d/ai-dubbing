@@ -146,10 +146,21 @@ VALUE_FLAGS=(
     --hf-token --workdir --output-dir --start-from --only --from-stage
     --emit -o
 )
+# Boolean flags forwarded to main.py without taking a value.
+BOOL_FLAGS=(--no-pyannote --no-cache --audio-only --no-video --read-only-cache)
 is_value_flag() {
     local flag="$1"
     for vf in "${VALUE_FLAGS[@]}"; do
         if [[ "$flag" == "$vf" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+is_bool_flag() {
+    local flag="$1"
+    for bf in "${BOOL_FLAGS[@]}"; do
+        if [[ "$flag" == "$bf" ]]; then
             return 0
         fi
     done
@@ -164,6 +175,12 @@ for arg in "${PRE_DASH[@]+"${PRE_DASH[@]}"}"; do
     if is_value_flag "$arg"; then
         MAIN_FLAGS+=("$arg")
         SKIP_NEXT=1
+        continue
+    fi
+    if is_bool_flag "$arg"; then
+        # Standalone boolean flag - never treats the next arg as its value
+        # and is never misinterpreted as the explicit output path.
+        MAIN_FLAGS+=("$arg")
         continue
     fi
     if [[ -z "$EXPLICIT_OUTPUT" && "$arg" != -* && -n "$arg" ]]; then
