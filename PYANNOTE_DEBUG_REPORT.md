@@ -2,30 +2,33 @@
 
 ## 1. Root cause
 
-The Pyannote diarization failure is **not** a code defect and **not** a
-missing HF_TOKEN.  The token is being loaded correctly from `.env` and
-is being forwarded to `Pipeline.from_pretrained(..., token=...)` exactly
-the way pyannote.audio 4.x expects.
+The Pyannote diarization failure had two distinct layers:
 
-The actual root cause is an **authorisation failure on Hugging Face**:
+1. **Primary cause (account-level):** the HF account behind
+   `HF_TOKEN` (`brunos3d`) had not accepted the gating terms for
+   `pyannote/segmentation-3.0`.  Hugging Face responded with
+   `huggingface_hub.errors.GatedRepoError: 403 Client Error` —
+   *"Access to model pyannote/segmentation-3.0 is restricted and you
+   are not in the authorized list."*  This blocked the entire
+   pipeline because `pyannote/speaker-diarization-3.1` calls
+   `Model.from_pretrained("pyannote/segmentation-3.0", ...)` internally.
 
-> `huggingface_hub.errors.GatedRepoError: 403 Client Error`
-> `Cannot access gated repo for url https://huggingface.co/pyannote/segmentation-3.0/resolve/main/pytorch_model.bin`
-> `Access to model pyannote/segmentation-3.0 is restricted and you are not in the authorized list.`
+2. **Secondary cause (code-level):** even after the account was
+   granted access, the pipeline failed with
+   `AttributeError: 'DiarizeOutput' object has no attribute
+   'itertracks'`.  pyannote.audio **4.x** changed the return type of
+   `Pipeline.__call__` from `pyannote.core.annotation.Annotation`
+   to a new `DiarizeOutput` dataclass whose
+   `.exclusive_speaker_diarization` attribute holds the
+   `Annotation` we used to receive directly.
 
-The Hugging Face account behind `HF_TOKEN` (resolved to user
-`brunos3d` with a `read` role token) has **not** accepted the gating
-terms for the underlying `pyannote/segmentation-3.0` model.  Because
-`pyannote/speaker-diarization-3.1` calls
-`Model.from_pretrained("pyannote/segmentation-3.0", ...)` internally,
-the gated download of the segmentation weights is on the critical path.
-Without accepting the terms there, no amount of code changes can make
-the pipeline load that model.
+3. **Tertiary cause (UX-level):** the original code silently fell
+   back to VAD+MFCC clustering whenever pyannote failed, hiding the
+   real error and producing the *1 speaker / 14 segments* output
+   reported in the bug.
 
-The previous symptom in the logs — *"using VAD+clustering fallback"* —
-was a silent degradation that hid the real error.  This has been
-corrected: pyannote is now the default, and a failure now aborts the
-pipeline with a clear error and a link to the gating page.
+All three causes have been addressed; pyannote now runs end-to-end on
+`input/reunião.mp4` and produces a multi-speaker segmentation.
 
 ## 2. Authorisation findings
 
@@ -37,7 +40,7 @@ Investigation steps:
    `src/stages/diarize.py` now print
    `HF_TOKEN loaded: True (hf_...LXX (len=37))`.
 3. Confirmed the token is reaching `Pipeline.from_pretrained`:
-   the new `_make_pipeline()` first tries the modern `token=` kwarg
+   `_make_pipeline()` first tries the modern `token=` kwarg
    (pyannote.audio 4.x), falling back to the legacy `use_auth_token=`
    kwarg (3.x) via a `TypeError` catch.  Inspecting the signature
    confirms the rename:
@@ -47,34 +50,19 @@ Investigation steps:
    ```
 4. Ran `huggingface_hub.whoami()` against the token: returns
    `brunos3d` with a `read`-role access token.
-5. Ran `huggingface_hub.model_info()` for both repos: both report
-   `gated=auto`, which is a *lightweight* probe that does **not**
-   require the user to have accepted gating.
-6. Ran the decisive probe `huggingface_hub.hf_hub_download()`:
+5. Ran the decisive probe `huggingface_hub.hf_hub_download()`:
 
-   | repo                                         | file              | result                          |
-   |----------------------------------------------|-------------------|---------------------------------|
-   | `pyannote/speaker-diarization-3.1`           | `config.yaml`     | **PASS**                        |
-   | `pyannote/segmentation-3.0`                  | `config.yaml`     | **FAIL** (403 GatedRepoError)   |
-   | `pyannote/segmentation-3.0`                  | `pytorch_model.bin` | **FAIL** (403 GatedRepoError) |
+   | repo                                         | file              | result (before)    | result (after)   |
+   |----------------------------------------------|-------------------|--------------------|------------------|
+   | `pyannote/speaker-diarization-3.1`           | `config.yaml`     | PASS               | PASS             |
+   | `pyannote/segmentation-3.0`                  | `config.yaml`     | FAIL (403)         | PASS             |
+   | `pyannote/segmentation-3.0`                  | `pytorch_model.bin` | FAIL (403)       | PASS             |
 
-7. The same 403 is raised by `pyannote.audio.Pipeline.from_pretrained`
-   when it tries to instantiate the underlying segmentation model
-   (`pyannote/audio/pipelines/speaker_diarization.py:222`):
-   ```python
-   model: Model = get_model(segmentation, token=token, cache_dir=cache_dir)
-   ```
-   This propagates to the user as the `GatedRepoError` quoted above.
-
-**Action required to fully unblock the pipeline:** open the following
-two pages while signed in as the account that owns the `HF_TOKEN` in
-`.env`, and click *Agree and access* on each:
-
-- https://huggingface.co/pyannote/segmentation-3.0
-- https://huggingface.co/pyannote/speaker-diarization-3.1
-
-After that, re-running `scripts/test_pyannote_auth.py` should print
-`RESULT: PASS - all required models reachable.`
+6. After accepting the gating terms on
+   https://huggingface.co/pyannote/segmentation-3.0 and
+   https://huggingface.co/pyannote/speaker-diarization-3.1, all
+   probes pass and `scripts/test_pyannote_auth.py` prints
+   `RESULT: PASS - all required models reachable.`
 
 ## 3. Dependency findings
 
@@ -82,7 +70,7 @@ After that, re-running `scripts/test_pyannote_auth.py` should print
 |-------------------|--------------------------|---------|
 | torch             | 2.8.0+cu128              | matches `pyproject.toml` pin. |
 | torchaudio        | 2.8.0+cu128              | matches `pyproject.toml` pin. |
-| pyannote.audio    | 4.0.4                    | newer than the `>=3.1` floor in `pyproject.toml`.  4.x removed `use_auth_token=`; we use the modern `token=` kwarg. |
+| pyannote.audio    | 4.0.4                    | newer than the `>=3.1` floor in `pyproject.toml`.  4.x removed `use_auth_token=` *and* changed the return type of `Pipeline.__call__`; both are handled below. |
 | pyannote.pipeline | 4.0.0                    | matches pyannote.audio 4.x. |
 | lightning         | 2.6.5                    | required by pyannote. |
 | huggingface_hub   | 1.19.0                   | exposes the GatedRepoError seen in the logs. |
@@ -92,7 +80,8 @@ After that, re-running `scripts/test_pyannote_auth.py` should print
 **Why the torchcodec warning is harmless in this pipeline.**  pyannote
 emits a `UserWarning` at import time telling the user to either fix
 torchcodec or pre-load audio as a `{"waveform": tensor, "sample_rate": int}`
-dict.  `src/stages/diarize.py:383-386` does exactly that:
+dict.  `src/stages/diarize.py` does exactly that (see
+`_annotation_to_segments` callers):
 
 ```python
 audio_in = {
@@ -107,9 +96,7 @@ asked to read a file.  No pinning is required to make the inference
 path work; the wheel-level symbol mismatch only affects pyannote's
 file-path-based input mode which we don't use.
 
-If the warning is bothersome in logs, it can be suppressed by either
-upgrading torch to a build that still exports `torch_from_blob`
-(unavailable — it was removed in 2.8) or by setting
+If the warning is bothersome in logs, it can be suppressed with
 `PYTHONWARNINGS=ignore::UserWarning:pyannote.audio.core.io` in the
 environment.  We deliberately do **not** pin a specific `torchcodec`
 version in `pyproject.toml` because every available wheel has a
@@ -129,9 +116,14 @@ inference code path.
   removes the `TypeError: from_pretrained() got an unexpected
   keyword argument 'use_auth_token'` noise on 4.x and silences the
   subsequent confusing fallback message.
-- Inverted the default.  Pyannote is the default diarizer; opting out
-  is now an explicit `--no-pyannote` flag passed all the way from
-  `dub.sh` → `cli.py` → `pipeline.py` → `DiarizeStage`.
+- **`_annotation_to_segments()` updated for pyannote 4.x.**  The
+  pipeline now returns a `DiarizeOutput` dataclass; we transparently
+  unwrap `.exclusive_speaker_diarization` (the no-overlap
+  `Annotation`) before iterating, while still accepting the bare
+  `Annotation` returned by 3.x.
+- Inverted the default.  Pyannote is the default diarizer; opting
+  out is now an explicit `--no-pyannote` flag passed all the way
+  from `dub.sh` → `cli.py` → `pipeline.py` → `DiarizeStage`.
 - On any pyannote failure the stage now **raises** instead of
   silently falling back:
   > `Pyannote diarization failed and no fallback is allowed (default behaviour).  Re-run with --no-pyannote to opt out of pyannote and use the VAD+MFCC clustering fallback, or fix the underlying error above.`
@@ -183,7 +175,7 @@ Standalone diagnostic that loads `HF_TOKEN` from `.env`, then runs:
 3. `HfApi.hf_hub_download()` (decisive probe) for the same repos,
    attempting to fetch `config.yaml` and `pytorch_model.bin`.
 4. `pyannote.audio.Pipeline.from_pretrained(..., token=...)` so the
-   verifier exercises the same code path as the pipeline.
+  verifier exercises the same code path as the pipeline.
 
 Prints `PASS:` / `FAIL:` per check and a final `RESULT: PASS` /
 `RESULT: FAIL` summary.  Exits 0 on success, 1 on failure.
@@ -196,7 +188,7 @@ Run it directly:
 
 ## 5. Validation results
 
-### 5.1 Auth verification
+### 5.1 Auth verification (final, after gating accepted)
 
 ```
 $ .venv/bin/python scripts/test_pyannote_auth.py
@@ -216,31 +208,54 @@ PASS: pyannote/segmentation-3.0        -> model_info ok (gated=auto, sha=e66f3d3
 
 --- Decisive download probe ---
 PASS: pyannote/speaker-diarization-3.1 :: download ok: config.yaml
-FAIL: pyannote/segmentation-3.0        :: download failed (config.yaml):     403 Client Error
-FAIL: pyannote/segmentation-3.0        :: download failed (pytorch_model.bin): 403 Client Error
+PASS: pyannote/segmentation-3.0        :: download ok: config.yaml
+PASS: pyannote/segmentation-3.0        :: download ok: pytorch_model.bin
 
 --- Pyannote pipeline load ---
-FAIL: Pipeline.from_pretrained raised: GatedRepoError: 403 Client Error
+PASS: Pipeline loaded: SpeakerDiarization
 ================================================================
-RESULT: FAIL - one or more models are not accessible.
+RESULT: PASS - all required models reachable.
 ```
 
-### 5.2 Pipeline run with strict default (pyannote is the default)
+### 5.2 Pipeline run with strict default — successful
 
 ```
 $ ./dub.sh input/reunião.mp4 pt en --no-cache
+>> Input   : input/reunião.mp4
+>> Source  : pt
+>> Target  : en
+>> Output  : ...
 ...
 [INFO] HF_TOKEN loaded: True (hf_...LXX (len=37))
 [INFO] Pyannote auth mode: token= keyword
-[ERROR] pyannote diarization failed: GatedRepoError: 403 Client Error
-[ERROR] Stage diarize failed: Pyannote diarization failed and no fallback is allowed (default behaviour).
-Pipeline failed: Pyannote diarization failed and no fallback is allowed (default behaviour).
+[INFO] Detected speakers: 2
+[INFO] Pyannote: 2 speakers / 19 segments
+[INFO]   speaker_01: primary profile selected
+[INFO]   speaker_02: primary profile selected
+[INFO]   speaker_01: dur=11.06s score=83.9 [SELECTED]
+[INFO]   speaker_02: dur=25.94s score=54.6 [SELECTED]
+[INFO] Detected language: pt (prob 1.00)
+[INFO] Segment   1: speaker=speaker_01 profile=primary
+[INFO] Segment   2: speaker=speaker_02 profile=primary
+[INFO] Segment   3: speaker=speaker_02 profile=primary
+[INFO] Segment   4: speaker=speaker_02 profile=primary
+[INFO] Segment   5: speaker=speaker_01 profile=primary
+[INFO] Segment   6: speaker=speaker_01 profile=primary
+[INFO] Segment   7: speaker=speaker_02 profile=primary
+[INFO] Segment   8: speaker=speaker_01 profile=primary
+[INFO] Segment   9: speaker=speaker_02 profile=primary
+[INFO] Segment  10: speaker=speaker_01 profile=primary
+[INFO] Segment  11: speaker=speaker_01 profile=primary
+[INFO] Segment  12: speaker=speaker_01 profile=primary
+[INFO] Segment  13: speaker=speaker_01 profile=primary
+[INFO] Segment  14: speaker=speaker_01 profile=primary
+[ok] Wrote: /home/bruno/github/tests/ai-dubbing/input/reunião-dub-en.mp4
 ```
 
-The pipeline now aborts at the diarize stage with a clear, actionable
-error.  There is no silent fallback to VAD+MFCC clustering.
+The output file is 20.8 MB, 92.9 s duration, ~1.88 Mbit/s.  No
+fallback path was taken; the only diarizer in use was pyannote.
 
-### 5.3 Pipeline run with `--no-pyannote` (forced fallback)
+### 5.3 Pipeline run with `--no-pyannote` (forced fallback) — still works
 
 ```
 $ .venv/bin/python main.py run --input "input/reunião.mp4" \
@@ -251,56 +266,46 @@ $ .venv/bin/python main.py run --input "input/reunião.mp4" \
      Video : /tmp/dub-test/final_video.mp4
 ```
 
-The fallback path still works and produces the same output it always
-did — namely the *1 speaker / 14 segments* segmentation on
-`input/reunião.mp4` that the original report complained about.  This
-confirms that the previously observed collapse-to-one-speaker was the
-fallback, not a bug in any other stage.
+This confirms the VAD+MFCC fallback path is still available as an
+opt-in escape hatch.
 
 ### 5.4 Speaker counts before and after
 
-| run                                              | mode            | speakers in `segments.json` | segments |
-|--------------------------------------------------|-----------------|-----------------------------|----------|
-| previous log (no flag)                           | fallback (silent) | 1                           | 14       |
-| `./dub.sh ... --no-cache` (default, new code)    | **aborts**      | n/a — pipeline halted       | n/a      |
-| `... --no-cache --no-pyannote` (forced fallback) | fallback        | 1                           | 14       |
+| run                                              | mode              | speakers            | segments |
+|--------------------------------------------------|-------------------|---------------------|----------|
+| previous log (no flag, old code)                 | fallback (silent) | 1                   | 14       |
+| `... --no-cache --no-pyannote` (new code)        | fallback          | 1                   | 14       |
+| `./dub.sh ... --no-cache` (default, new code)    | **pyannote**      | **2** (speaker_01 + speaker_02) | **19** |
 
-Pyannote itself was never run successfully on this machine during
-this session, so a *"speakers after fix"* count cannot be reported
-without first completing the gating acceptance step.  Once the
-`brunos3d` account has accepted the gating terms for both repos
-(section 2), re-running `./dub.sh input/reunião.mp4 pt en --no-cache`
-should produce a multi-speaker segmentation (the meeting recording
-typically yields 4–5 distinct speakers) and the log should include
-`Detected speakers: N`.
+The 1 → 2 speaker count and 14 → 19 segment count are the direct
+result of switching from MFCC clustering (which can't tell the two
+voices apart) to pyannote.audio 4.x (which can).
 
 ## 6. Is Pyannote executing successfully?
 
-**No, not yet.**  The code path is correct, the token is reaching
-`Pipeline.from_pretrained(..., token=...)`, and the strict default
-behaviour is in place.  The remaining blocker is the 403 GatedRepoError
-on `pyannote/segmentation-3.0`, which is an account-level
-authorisation issue and cannot be fixed from this repository.
+**Yes.**  All four required probes in `scripts/test_pyannote_auth.py`
+pass, the pipeline runs end-to-end, the diarize stage logs
+`Detected speakers: 2`, and the final dubbed video
+(`input/reunião-dub-en.mp4`, 20.8 MB, 92.9 s) is produced without
+ever entering the VAD+MFCC fallback.
 
-The fix is one-time and human-driven: accept the gating terms on
-https://huggingface.co/pyannote/segmentation-3.0 and
-https://huggingface.co/pyannote/speaker-diarization-3.1 with the
-account that owns the `HF_TOKEN`, then re-run
-`scripts/test_pyannote_auth.py` to confirm and re-run the dubbing
-pipeline normally.  No further code changes are required.
+The remaining torchcodec import-time warning is benign on this
+inference path (audio is pre-loaded as a `{"waveform": tensor,
+"sample_rate": int}` dict); it does not affect diarization quality
+or pipeline success.
 
-## 7. Summary of the commit
+## 7. Summary of the commits
 
-Files changed in this debugging pass:
+Two commits, both on `main`:
 
-- `src/stages/diarize.py`     — token diagnostics, modern `token=`
-                                kwarg, strict-default behaviour,
-                                clear actionable error messages
-- `src/cli.py`                — `--no-pyannote` boolean flag
-- `src/pipeline.py`           — `no_pyannote` plumbing
-- `dub.sh`                    — `BOOL_FLAGS` array + `is_bool_flag`
-                                helper so boolean flags are not
-                                mis-parsed as values
-- `pyproject.toml`            — gating + dotenv + torchcodec notes
-- `scripts/test_pyannote_auth.py` — new standalone HF access verifier
-- `PYANNOTE_DEBUG_REPORT.md`  — this file
+1. `d257830 fix: restore pyannote diarization and eliminate fallback authorization failures`
+   - inverts the diarize default to pyannote
+   - adds `--no-pyannote` opt-out
+   - adds HF_TOKEN diagnostics and modern `token=` kwarg
+   - adds `BOOL_FLAGS` handling in `dub.sh`
+   - adds `scripts/test_pyannote_auth.py`
+   - adds `PYANNOTE_DEBUG_REPORT.md`
+2. (this report update) documents the final pyannote 4.x
+   `DiarizeOutput` API fix in `_annotation_to_segments` and the
+   successful end-to-end run.
+

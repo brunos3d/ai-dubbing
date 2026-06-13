@@ -68,7 +68,17 @@ def _make_pipeline(model_id: str, hf_token: Optional[str]):
 
 
 def _annotation_to_segments(annotation, min_duration: float = 0.3) -> List[Dict[str, Any]]:
-    """Convert pyannote Annotation to a list of {speaker, start, end} dicts."""
+    """Convert pyannote diarization output to a list of {speaker, start, end} dicts.
+
+    pyannote.audio 4.x returns a ``DiarizeOutput`` dataclass with an
+    ``exclusive_speaker_diarization`` attribute that is an
+    ``pyannote.core.annotation.Annotation``.  Earlier versions returned
+    the ``Annotation`` directly.  This helper accepts both.
+    """
+    # 4.x returns a DiarizeOutput; pull out the exclusive (no-overlap) diarization
+    # which is what downstream stages expect.
+    if hasattr(annotation, "exclusive_speaker_diarization"):
+        annotation = annotation.exclusive_speaker_diarization
     out: List[Dict[str, Any]] = []
     for turn, _, speaker in annotation.itertracks(yield_label=True):
         start = float(turn.start)
