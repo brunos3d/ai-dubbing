@@ -139,8 +139,26 @@ class Pipeline:
                 output_dir=str(self.output_dir),
                 config={"whisper_model": whisper_model, "target_lufs": target_lufs},
             )
-            if not self.read_only_cache:
-                self.checkpoint.save()
+        if not self.read_only_cache:
+            self.checkpoint.save()
+
+    def pipeline_config_dict(self) -> dict:
+        """Return a deterministic dict used as input to ``pipeline_config_hash``.
+
+        Crucially, the ``hf_token`` itself is *not* present — only the
+        boolean ``hf_token_available`` flag is recorded.  Rotating a
+        token or switching HF accounts must not invalidate workspaces.
+        """
+        return {
+            "whisper_model": self.whisper_model,
+            "target_lufs": self.target_lufs,
+            "no_pyannote": self.no_pyannote,
+            "min_speakers": self.min_speakers,
+            "max_speakers": self.max_speakers,
+            "skip_video": self.skip_video,
+            "glossary_path": str(self.glossary_path) if self.glossary_path else None,
+            "hf_token_available": bool(self.hf_token),
+        }
 
     def _build_stage(self, name: str):
         if name == "extract":
