@@ -11,6 +11,16 @@ from typing import List, Optional
 from .pipeline import Pipeline
 from .utils.cache import CacheManager
 from .utils.paths import project_root
+from .workspace.cli import (
+    cmd_workspace_clean,
+    cmd_workspace_inspect,
+    cmd_workspace_list,
+    cmd_workspace_open,
+    cmd_workspace_show,
+    cmd_workspace_validate,
+)
+from .workspace.paths import workspaces_root
+from .workspace.pipeline import WorkspacePipeline
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -82,6 +92,66 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "audio", "video", "both"),
         help="What to deliver.",
     )
+
+    # Workspace Prepare (run extract..translate, stop)
+    prepare_p = subparsers.add_parser(
+        "prepare",
+        help="Prepare a workspace (runs extract..translate, stops before TTS)",
+    )
+    prepare_p.add_argument("--input", "-i", required=True, help="Path to input media (mp4/mkv/mov/mp3/wav/flac)")
+    prepare_p.add_argument("--source-language", "-s", required=True, help="Source language code (e.g. en, pt, es)")
+    prepare_p.add_argument("--target-language", "-t", required=True, help="Target language code (e.g. en, pt-BR, es)")
+    prepare_p.add_argument("--name", default=None, help="Optional override for the workspace slug")
+    prepare_p.add_argument("--whisper-model", default="large-v3", help="faster-whisper model size")
+    prepare_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
+    prepare_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
+    prepare_p.add_argument(
+        "--no-pyannote",
+        action="store_true",
+        help="Opt out of pyannote diarization and use the VAD+MFCC clustering fallback.",
+    )
+    prepare_p.add_argument("--min-speakers", type=int, default=None, help="Minimum number of speakers for diarization")
+    prepare_p.add_argument("--max-speakers", type=int, default=None, help="Maximum number of speakers for diarization")
+
+    # Workspace Generate (run generate..video, DAG-driven)
+    generate_p = subparsers.add_parser(
+        "generate",
+        help="Run TTS + downstream stages for an existing workspace (DAG-driven)",
+    )
+    generate_p.add_argument(
+        "workspace_id",
+        nargs="?",
+        default=None,
+        help="Workspace ID; defaults to the most recently modified workspace",
+    )
+    generate_p.add_argument("--from-stage", default=None, help="Force a run starting at this stage")
+    generate_p.add_argument("--to-stage", default=None, help="Cap the run at this stage (inclusive)")
+    generate_p.add_argument("--force", action="store_true", help="Re-run every stage regardless of staleness")
+    generate_p.add_argument("--output-dir", "-o", default="output", help="Where to write final outputs (relative to workspace)")
+
+    # Workspace Management (list/inspect/show/open/validate/clean)
+    workspace_p = subparsers.add_parser("workspace", help="Manage existing workspaces")
+    workspace_sub = workspace_p.add_subparsers(dest="workspace_command")
+
+    workspace_sub.add_parser("list", help="List all workspaces")
+
+    ws_inspect_p = workspace_sub.add_parser("inspect", help="Show the manifest stage table for a workspace")
+    ws_inspect_p.add_argument("workspace_id", help="Workspace ID")
+
+    ws_show_p = workspace_sub.add_parser("show", help="Print the path of a subdir of the workspace")
+    ws_show_p.add_argument("workspace_id", help="Workspace ID")
+    ws_show_p.add_argument("path", nargs="?", default=None, help="Subdir path (e.g. media, translation); omit to list all")
+
+    ws_open_p = workspace_sub.add_parser("open", help="Print the workspace root path")
+    ws_open_p.add_argument("workspace_id", help="Workspace ID")
+
+    ws_validate_p = workspace_sub.add_parser("validate", help="Run every per-artifact validator on the workspace")
+    ws_validate_p.add_argument("workspace_id", help="Workspace ID")
+
+    ws_clean_p = workspace_sub.add_parser("clean", help="Delete a workspace (or only its output/)")
+    ws_clean_p.add_argument("workspace_id", help="Workspace ID")
+    ws_clean_p.add_argument("--keep-outputs", action="store_true", help="Delete only the output/ subdir, keep the workspace")
+    ws_clean_p.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
     # Cache Management
     cache_p = subparsers.add_parser("cache", help="Manage the pipeline cache")
@@ -171,12 +241,96 @@ def handle_glossary(args):
         print(f"Generated glossary template: {out_path}")
 
 
+def _handle_prepare(args) -> int:
+    if not Path(args.input).exists():
+        print(f"Input file not found: {args.input}", file=sys.stderr)
+        return 2
+
+    wsp = WorkspacePipeline(
+        input_path=str(Path(args.input).resolve()),
+        source_language=args.source_language,
+        target_language=args.target_language,
+        whisper_model=args.whisper_model,
+        hf_token=args.hf_token,
+        glossary_path=Path(args.glossary).resolve() if args.glossary else None,
+        no_pyannote=args.no_pyannote,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
+    )
+    try:
+        wid, root = wsp.prepare()
+    except Exception as exc:  # noqa: BLE001
+        print(f"Prepare failed: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+    print(f"[ok] Workspace ready: {wid}")
+    print(f"     Path: {root}")
+    return 0
+
+
+def _resolve_latest_workspace() -> str:
+    """Return the most recently modified workspace directory name, or exit."""
+    root = workspaces_root()
+    if not root.exists():
+        print(f"No workspaces found at {root}.", file=sys.stderr)
+        raise SystemExit(2)
+    candidates = [p for p in root.iterdir() if p.is_dir()]
+    if not candidates:
+        print(f"No workspaces found at {root}.", file=sys.stderr)
+        raise SystemExit(2)
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
+    return latest.name
+
+
+def _handle_generate(args) -> int:
+    wid = args.workspace_id or _resolve_latest_workspace()
+
+    wsp = WorkspacePipeline(
+        input_path="/dev/null",
+        source_language="?",
+        target_language="?",
+    )
+    try:
+        resolved_wid, root = wsp.generate(
+            wid,
+            from_stage=args.from_stage,
+            to_stage=args.to_stage,
+            force=args.force,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Generate failed: {exc}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+    print(f"[ok] Generated: {root / args.output_dir}")
+    return 0
+
+
+def _handle_workspace(args) -> int:
+    sub = getattr(args, "workspace_command", None)
+    if sub == "list":
+        return cmd_workspace_list(args)
+    if sub == "inspect":
+        return cmd_workspace_inspect(args)
+    if sub == "show":
+        return cmd_workspace_show(args)
+    if sub == "open":
+        return cmd_workspace_open(args)
+    if sub == "validate":
+        return cmd_workspace_validate(args)
+    if sub == "clean":
+        return cmd_workspace_clean(args)
+    print("No workspace subcommand given. Try: list, inspect, show, open, validate, clean.", file=sys.stderr)
+    return 2
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     # Pre-process argv to inject 'run' if no subcommand is present
     if argv is None:
         argv = sys.argv[1:]
     
-    if argv and argv[0] not in ("run", "cache", "glossary", "-h", "--help"):
+    if argv and argv[0] not in ("run", "cache", "glossary", "prepare", "generate", "workspace", "-h", "--help"):
         argv = ["run"] + argv
     elif not argv:
         argv = ["--help"]
@@ -191,6 +345,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "glossary":
         handle_glossary(args)
         return 0
+
+    if args.command == "prepare":
+        return _handle_prepare(args)
+
+    if args.command == "generate":
+        return _handle_generate(args)
+
+    if args.command == "workspace":
+        return _handle_workspace(args)
 
     if not Path(args.input).exists():
         print(f"Input file not found: {args.input}", file=sys.stderr)
