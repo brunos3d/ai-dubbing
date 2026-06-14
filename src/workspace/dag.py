@@ -86,20 +86,40 @@ def _is_derived(path: str, manifest: Manifest) -> bool:
 
 
 def _stage_has_config_change(
-    stage: str,
+    stage_name: str,
     manifest: Manifest,
-    recorded_configs: Optional[dict[str, dict]],
+    current_configs: Optional[dict[str, dict]],
 ) -> bool:
     """Return True if ``stage``'s config differs from the recorded config.
 
     A config change (whisper model, target LUFS, ...) invalidates the stage
-    even when no file hash changed. ``recorded_configs`` is the dict that
-    ``WorkspacePipeline`` passes in; if it's ``None`` we conservatively
+    even when no file hash changed. ``current_configs`` is the dict of
+    currently requested settings; if it's ``None`` we conservatively
     assume no config change.
     """
-    if recorded_configs is None:
+    if current_configs is None:
         return False
-    return stage in recorded_configs or False
+    
+    # If the stage is not in current_configs, it means we don't have
+    # new settings for it (e.g. it's a stage from a different phase).
+    if stage_name not in current_configs:
+        return False
+        
+    current = current_configs[stage_name]
+    
+    # Get the recorded config from the manifest.
+    rec = manifest.stages.get(stage_name)
+    if rec is None:
+        return True # Brand new stage
+        
+    recorded = rec.config
+    
+    # We use a simple equality check for the dicts.
+    # Note: pipeline_config_hash (in content_hash.py) handles the 
+    # exclusion of secrets like hf_token, but here we expect
+    # current_configs[stage_name] to already be cleaned or for
+    # the comparison to be safe.
+    return current != recorded
 
 
 def _iter_io(manifest: Manifest) -> Iterable[tuple[str, str, str]]:
@@ -125,7 +145,7 @@ def compute_stale_set(
     workspace_root: Path,
     cli_overrides: Optional[CliOverrides] = None,
     *,
-    recorded_configs: Optional[dict[str, dict]] = None,
+    current_configs: Optional[dict[str, dict]] = None,
 ) -> list[str]:
     """Return the topologically-sorted list of stages that need to re-run.
 
@@ -171,7 +191,7 @@ def compute_stale_set(
                     if producer is not None:
                         stale.add(producer)
                     stale.add(stage_name)
-        if _stage_has_config_change(stage_name, manifest, recorded_configs):
+        if _stage_has_config_change(stage_name, manifest, current_configs):
             stale.add(stage_name)
 
     # 3. Propagate downstream until fixed point.

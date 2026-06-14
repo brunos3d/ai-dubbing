@@ -128,6 +128,19 @@ def build_parser() -> argparse.ArgumentParser:
     generate_p.add_argument("--to-stage", default=None, help="Cap the run at this stage (inclusive)")
     generate_p.add_argument("--force", action="store_true", help="Re-run every stage regardless of staleness")
     generate_p.add_argument("--output-dir", "-o", default="output", help="Where to write final outputs (relative to workspace)")
+    
+    # Allow overriding pipeline config during generate
+    generate_p.add_argument("--whisper-model", default="large-v3", help="faster-whisper model size")
+    generate_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
+    generate_p.add_argument("--target-lufs", type=float, default=-16.0, help="Loudness target for final mix")
+    generate_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
+    generate_p.add_argument(
+        "--no-pyannote",
+        action="store_true",
+        help="Opt out of pyannote diarization and use the VAD+MFCC clustering fallback.",
+    )
+    generate_p.add_argument("--min-speakers", type=int, default=None, help="Minimum number of speakers for diarization")
+    generate_p.add_argument("--max-speakers", type=int, default=None, help="Maximum number of speakers for diarization")
 
     # Workspace Management (list/inspect/show/open/validate/clean)
     workspace_p = subparsers.add_parser("workspace", help="Manage existing workspaces")
@@ -290,6 +303,13 @@ def _handle_generate(args) -> int:
         input_path="/dev/null",
         source_language="?",
         target_language="?",
+        whisper_model=args.whisper_model,
+        hf_token=args.hf_token,
+        target_lufs=args.target_lufs,
+        glossary_path=Path(args.glossary).resolve() if args.glossary else None,
+        no_pyannote=args.no_pyannote,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
     )
     try:
         resolved_wid, root = wsp.generate(

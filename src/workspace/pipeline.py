@@ -168,6 +168,15 @@ def workspace_layout() -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _find_source_media(root: Path) -> Optional[Path]:
+    """Return the path to the single file under ``root/source/``, if it exists."""
+    source_dir = root / "source"
+    if not source_dir.exists():
+        return None
+    files = [p for p in source_dir.iterdir() if p.is_file()]
+    return files[0] if files else None
+
+
 def _build_stage(
     name: str,
     workspace_root: Path,
@@ -233,10 +242,11 @@ def _build_stage(
     if name == "mix":
         return MixStage(workspace_root, output_dir, target_lufs=target_lufs, subdir=subdir)
     if name == "video":
+        source_media = _find_source_media(workspace_root)
         return VideoStage(
             workspace_root,
             output_dir,
-            str(workspace_root / "source"),
+            str(source_media) if source_media else str(workspace_root / "source"),
             subdir=subdir,
         )
     raise KeyError(f"unknown stage: {name!r}")
@@ -477,6 +487,40 @@ class WorkspacePipeline:
         manifest.save(root / "manifest.json")
         return wid, root
 
+    def _hydrate_from_metadata(self, root: Path) -> None:
+        """Hydrate pipeline attributes from metadata.json."""
+        meta_path = root / "metadata.json"
+        if not meta_path.exists():
+            return
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        source = meta.get("source", {})
+        if self.input_path == "/dev/null":
+            self.input_path = source.get("media_path", self.input_path)
+        if self.source_language == "?":
+            self.source_language = source.get("source_language", self.source_language)
+        if self.target_language == "?":
+            self.target_language = source.get("target_language", self.target_language)
+
+        config = meta.get("config", {})
+        # We only hydrate if the current values are defaults.
+        # This is a bit heuristic, but it works for 'generate' CLI.
+        if self.whisper_model == "large-v3":
+            self.whisper_model = config.get("whisper_model", self.whisper_model)
+        if self.target_lufs == -16.0:
+            self.target_lufs = config.get("target_lufs", self.target_lufs)
+        if self.no_pyannote is False:
+            self.no_pyannote = config.get("no_pyannote", self.no_pyannote)
+        if self.min_speakers is None:
+            self.min_speakers = config.get("min_speakers", self.min_speakers)
+        if self.max_speakers is None:
+            self.max_speakers = config.get("max_speakers", self.max_speakers)
+        if self.glossary_path is None and config.get("glossary_path"):
+            self.glossary_path = Path(config["glossary_path"])
+
     def generate(
         self,
         workspace_id_str: Optional[str] = None,
@@ -489,6 +533,10 @@ class WorkspacePipeline:
         if workspace_id_str is None:
             workspace_id_str, _, _ = self._id()
         root = self._resolve_workspace_root(workspace_id_str)
+        
+        # Hydrate settings from metadata before computing staleness.
+        self._hydrate_from_metadata(root)
+        
         manifest_path = root / "manifest.json"
         manifest = Manifest.load(manifest_path)
         if manifest is None:
@@ -496,8 +544,18 @@ class WorkspacePipeline:
                 f"No manifest.json at {manifest_path}; run prepare() first."
             )
 
+        # Build current_configs for invalidation DAG.
+        current_configs = {}
+        for name in STAGE_ORDER:
+            cls = STAGE_CLASSES.get(name)
+            if cls:
+                current_configs[name] = {
+                    k: getattr(self, k, None)
+                    for k in getattr(cls, "config_fields", [])
+                }
+
         overrides = CliOverrides(force=force, from_stage=from_stage, to_stage=to_stage)
-        stale = compute_stale_set(manifest, root, overrides)
+        stale = compute_stale_set(manifest, root, overrides, current_configs=current_configs)
         if not stale:
             LOG.info("Nothing to do: no stale stages for %s", workspace_id_str)
             return workspace_id_str, root
@@ -646,7 +704,8 @@ class WorkspacePipeline:
         # sensible to read. We use the workspace-relative paths the spec
         # defines, joined with ``workspace_root`` (and the per-stage subdir
         # where applicable).
-        context["input_path"] = str(workspace_root / "source" / Path(self.input_path).name)
+        source_media = _find_source_media(workspace_root)
+        context["input_path"] = str(source_media) if source_media else self.input_path
         context["source_language"] = self.source_language
         context["target_language"] = self.target_language
         context["workdir"] = str(workspace_root)
