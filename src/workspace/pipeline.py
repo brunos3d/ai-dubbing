@@ -426,9 +426,33 @@ class WorkspacePipeline:
         for p in _DERIVED_PATHS:
             m.add_derived_path(p)
         # Seed an empty StageRecord for every stage so downstream code can
-        # always look up ``manifest.stages[name]``.
+        # always look up ``manifest.stages[name]`` and so the invalidation
+        # DAG can see the declared inputs/outputs of stages that have not
+        # yet been run (e.g. ``generate..video`` after ``prepare()``).
         for name in STAGE_ORDER:
-            m.add_stage(name, StageRecord(name=name, status="pending"))
+            cls = STAGE_CLASSES.get(name)
+            if cls is None:
+                m.add_stage(name, StageRecord(name=name, status="pending"))
+                continue
+            inputs = []
+            for rel in getattr(cls, "inputs", []):
+                ref = self._maybe_artifact(root, rel)
+                if ref is not None:
+                    inputs.append(ref)
+            outputs = []
+            for rel in getattr(cls, "outputs", []):
+                ref = self._maybe_artifact(root, rel)
+                if ref is not None:
+                    outputs.append(ref)
+            m.add_stage(
+                name,
+                StageRecord(
+                    name=name,
+                    status="pending",
+                    inputs=inputs,
+                    outputs=outputs,
+                ),
+            )
         return m
 
     # -- prepare / generate ----------------------------------------------
@@ -445,6 +469,12 @@ class WorkspacePipeline:
 
         manifest = self._load_or_init_manifest(wid, root=root)
         self._run_stages(manifest, prepare_stages(), start_at="extract", workspace_root=root)
+        # Record the *initial* disk hashes for the not-yet-run generate
+        # stages.  This must happen *before* the user has a chance to edit
+        # any file, so the invalidation DAG in a later ``generate()`` has
+        # a real baseline to diff against.
+        self._backfill_manifest_from_disk(manifest, root)
+        manifest.save(root / "manifest.json")
         return wid, root
 
     def generate(
@@ -474,7 +504,67 @@ class WorkspacePipeline:
         self._run_stages(manifest, stale, start_at=stale[0], workspace_root=root)
         return workspace_id_str, root
 
+    def _refresh_consumer_inputs(
+        self, manifest: Manifest, producer_output_path: str, workspace_root: Path
+    ) -> None:
+        """Update every StageRecord whose ``inputs`` reference ``producer_output_path``.
+
+        Called after a stage's outputs have been promoted so that the
+        downstream consumers see the new (real) hash instead of the
+        empty placeholder recorded when the manifest was first
+        created.
+        """
+        for consumer_name, consumer_rec in manifest.stages.items():
+            if consumer_name == manifest.stages and False:
+                pass
+            new_inputs = []
+            changed = False
+            for ref in consumer_rec.inputs:
+                if ref.path == producer_output_path:
+                    fresh = self._maybe_artifact(workspace_root, producer_output_path)
+                    if fresh is not None and fresh.sha256 != ref.sha256:
+                        new_inputs.append(fresh)
+                        changed = True
+                        continue
+                new_inputs.append(ref)
+            if changed:
+                consumer_rec.inputs = new_inputs
+
     # -- metadata.json ----------------------------------------------------
+
+    def _backfill_manifest_from_disk(
+        self, manifest: Manifest, root: Path
+    ) -> None:
+        """Populate the inputs/outputs of stages that have not yet been run.
+
+        Called by :meth:`generate` so the invalidation DAG has a baseline
+        for stages whose ``run`` was never invoked in this workspace
+        (typically everything after ``translate`` on a fresh
+        ``prepare()``).  Idempotent: only fills a stage's record if its
+        inputs or outputs are currently empty.
+        """
+        for name in STAGE_ORDER:
+            cls = STAGE_CLASSES.get(name)
+            if cls is None:
+                continue
+            rec = manifest.stages.get(name)
+            if rec is None:
+                rec = StageRecord(name=name, status="pending")
+                manifest.stages[name] = rec
+            if not rec.inputs:
+                rec.inputs = [
+                    ref
+                    for rel in getattr(cls, "inputs", [])
+                    for ref in [self._maybe_artifact(root, rel)]
+                    if ref is not None
+                ]
+            if not rec.outputs:
+                rec.outputs = [
+                    ref
+                    for rel in getattr(cls, "outputs", [])
+                    for ref in [self._maybe_artifact(root, rel)]
+                    if ref is not None
+                ]
 
     def _link_source(self, root: Path) -> None:
         """Symlink the original input under ``<root>/source/<basename>``.
@@ -644,7 +734,8 @@ class WorkspacePipeline:
                 finished_at=_now_iso(),
                 duration_s=time.time() - started,
                 config={
-                    k: getattr(self, k) for k in getattr(stage_cls, "config_fields", [])
+                    k: getattr(stage, k, None)
+                    for k in getattr(stage_cls, "config_fields", [])
                 },
                 error=str(exc),
             )
@@ -658,7 +749,8 @@ class WorkspacePipeline:
 
         # Build the per-stage record: config, inputs, outputs (with hashes).
         config = {
-            k: getattr(self, k) for k in getattr(stage_cls, "config_fields", [])
+            k: getattr(stage, k, None)
+            for k in getattr(stage_cls, "config_fields", [])
         }
         inputs: List[ArtifactRef] = []
         for rel in getattr(stage_cls, "inputs", []):
@@ -684,15 +776,33 @@ class WorkspacePipeline:
                 outputs=outputs,
             ),
         )
+        # Refresh the input records of *downstream* stages so they point
+        # at the just-promoted files.  Without this, downstream
+        # StageRecords keep the empty-sha256 placeholders the backfill
+        # inserted at manifest-creation time, and the invalidation DAG
+        # spuriously marks those downstream stages as stale from the
+        # start.
+        for out_ref in outputs:
+            self._refresh_consumer_inputs(manifest, out_ref.path, workspace_root)
+        manifest.save(workspace_root / "manifest.json")
         manifest.save(workspace_root / "manifest.json")
         LOG.info("[ok] %s done in %.2fs", name, time.time() - started)
 
     @staticmethod
     def _maybe_artifact(workspace_root: Path, rel_path: str) -> Optional[ArtifactRef]:
-        """Return an ``ArtifactRef`` for ``rel_path`` if it exists on disk."""
+        """Return an ``ArtifactRef`` for ``rel_path`` if it exists on disk.
+
+        For files that do not exist yet (e.g. outputs of stages that
+        have not run), return a *placeholder* ``ArtifactRef`` with
+        ``sha256=""``.  The invalidation DAG treats a missing/empty
+        recorded hash as a mismatch, so a downstream stage whose input
+        has not been produced yet is correctly considered stale.  This
+        is what enables the post-translate cascade to run end-to-end
+        after a fresh ``prepare()``.
+        """
         full = Path(workspace_root) / rel_path
         if not full.exists() or not full.is_file():
-            return None
+            return ArtifactRef(path=rel_path, sha256="", size_bytes=0)
         try:
             size = full.stat().st_size
             digest = sha256_file(full)
