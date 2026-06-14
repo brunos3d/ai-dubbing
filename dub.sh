@@ -36,11 +36,21 @@ ai-dubbing: Local-first multilingual dubbing pipeline
 
 Usage:
   dub.sh <input> <src-lang> <tgt-lang> [output] [options]
+  dub.sh prepare <input> <src> <tgt> [--name <slug>] [--glossary <file>]
+  dub.sh generate <workspace-id> [--from-stage NAME] [--to-stage NAME] [--force]
+  dub.sh workspace <command>
   dub.sh cache <command>
   dub.sh glossary <command>
 
 Commands:
   run (default)      Execute the dubbing pipeline on an input file.
+  prepare            Create a workspace and run stages up to translate.
+  generate           Run a workspace from generate..video (resume/edit flow).
+  workspace list     List all workspaces.
+  workspace inspect  Show metadata + manifest summary for a workspace.
+  workspace show     Print a file from inside a workspace.
+  workspace validate Validate every declared artifact in a workspace.
+  workspace clean    Delete a workspace (keeps outputs by default).
   cache info         Show aggregate cache statistics.
   cache list         List all cached pipeline runs.
   cache prune        Remove stale cache entries (>7 days old).
@@ -52,9 +62,12 @@ Primary Options:
   -s, --src-lang     Source language code (e.g. en, pt, ru).
   -t, --tgt-lang     Target language code (e.g. en, pt-BR, es).
   -o, --output-dir   Where to write final outputs (default: output/).
+  --name SLUG        Workspace slug override (prepare only).
   --glossary PATH    JSON file for preserving names/brands from translation.
   --no-cache         Ignore existing cache and rebuild from scratch.
   --from-stage NAME  Reuse cache up to NAME, then rebuild.
+  --to-stage NAME    Stop after NAME (generate only).
+  --force            Re-run all stages regardless of cache (generate only).
   --audio-only       Skip video remux; emit only final_audio.wav.
 
 Manual & Tips for Professional Dubbing:
@@ -65,7 +78,12 @@ Manual & Tips for Professional Dubbing:
    $ [Edit entity_glossary.json with your terms]
    $ dub.sh input.mp4 pt en --glossary entity_glossary.json
 
-2. Improving Quality:
+2. Two-Phase Workflow (prepare / generate):
+   $ dub.sh prepare  input.mp4 pt en --name myvideo
+   $ dub.sh generate <workspace-id>          # run generate..video
+   Edit files under the workspace root, then re-run `generate` to resume.
+
+3. Improving Quality:
    - Use 'large-v3' (default) for transcription.
    - If audio is noisy, Demucs separation (automatic) will help.
 
@@ -104,6 +122,36 @@ if [[ "${1:-}" == "glossary" ]]; then
         PYTHON_BIN="$(command -v python3)"
     fi
     "$PYTHON_BIN" main.py glossary "${@:2}"
+    exit 0
+fi
+
+# Handle prepare subcommand
+if [[ "${1:-}" == "prepare" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        PYTHON_BIN="$(command -v python3)"
+    fi
+    "$PYTHON_BIN" main.py prepare "${@:2}"
+    exit 0
+fi
+
+# Handle generate subcommand
+if [[ "${1:-}" == "generate" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        PYTHON_BIN="$(command -v python3)"
+    fi
+    "$PYTHON_BIN" main.py generate "${@:2}"
+    exit 0
+fi
+
+# Handle workspace subcommand
+if [[ "${1:-}" == "workspace" ]]; then
+    PYTHON_BIN=".venv/bin/python"
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        PYTHON_BIN="$(command -v python3)"
+    fi
+    "$PYTHON_BIN" main.py workspace "${@:2}"
     exit 0
 fi
 
@@ -429,3 +477,11 @@ SIZE=$(du -h -- "$FINAL_PATH" 2>/dev/null | cut -f1)
 echo ""
 echo "[ok] Wrote: $FINAL_PATH"
 echo "     Size : ${SIZE:-?}    Duration: ${DUR:-?}s"
+# Print the most recent workspace ID (if any) so one-shot users can resume later.
+WS_ROOT="${HOME}/.local/share/ai-dubbing/workspaces"
+if [[ -d "$WS_ROOT" ]]; then
+    LATEST_WS=$(ls -1t "$WS_ROOT" 2>/dev/null | head -1 || true)
+    if [[ -n "$LATEST_WS" ]]; then
+        echo "     Workspace: $LATEST_WS  ($WS_ROOT/$LATEST_WS)"
+    fi
+fi
