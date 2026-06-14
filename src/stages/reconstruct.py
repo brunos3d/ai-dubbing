@@ -139,13 +139,24 @@ def reconstruct_timeline(
 
 class ReconstructStage:
     name = "reconstruct"
+    inputs: List[str] = [
+        "aligned_manifest.json",
+        "media/background.wav",
+    ]
+    outputs: List[str] = ["output/reconstructed_speech.wav"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = ["output/reconstructed_speech.wav"]
+    config_fields: List[str] = ["target_sr"]
 
-    def __init__(self, workdir: Path, output_dir: Path, target_sr: int = 24000):
+    def __init__(self, workdir: Path, output_dir: Path, target_sr: int = 24000, subdir: str | None = None):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.output_dir = Path(output_dir)
         self.target_sr = target_sr
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.output_dir / "reconstructed_speech.wav"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

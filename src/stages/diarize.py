@@ -859,6 +859,21 @@ class DiarizeStage:
     """Detect speaker changes with pyannote.audio (or VAD+clustering fallback)."""
 
     name = "diarize"
+    inputs: List[str] = ["media/speech.wav"]
+    outputs: List[str] = [
+        "diarization/segments.json",
+        "diarization/embeddings.npz",
+        "diarization/embeddings.meta.json",
+        "diarization/metadata.json",
+    ]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = ["diarization/embeddings.npz"]
+    config_fields: List[str] = [
+        "model_id",
+        "min_speakers",
+        "max_speakers",
+        "no_pyannote",
+    ]
 
     def __init__(
         self,
@@ -870,8 +885,11 @@ class DiarizeStage:
         device: str = "cuda",
         fallback_num_speakers: int = 2,
         no_pyannote: bool = False,
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.hf_token = hf_token
         self.model_id = model_id
         self.min_speakers = min_speakers
@@ -881,8 +899,9 @@ class DiarizeStage:
         # When True, skip pyannote entirely and use the VAD+MFCC fallback.
         # Pyannote is the default diarizer - opting out must be explicit.
         self.no_pyannote = no_pyannote
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.workdir / "segments.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

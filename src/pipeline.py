@@ -254,7 +254,7 @@ class Pipeline:
                     if name in ("reconstruct", "mix"):
                         LOG.info(f"context['manifest_path']={context.get('manifest_path')}")
                     result = stage.run(context)
-                outputs = [str(p) for p in stage.outputs() if Path(p).exists()]
+                outputs = [str(p) for p in stage.output_paths() if Path(p).exists()]
                 self.checkpoint.mark_done(name, output_files=outputs, metadata={"duration_s": time.time() - t0})
                 self._hydrate_context(context, name, result)
                 context[f"_stage_{name}_hydrated"] = True

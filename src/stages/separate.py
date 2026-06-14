@@ -94,6 +94,11 @@ class SeparateStage:
     """Run Demucs to separate vocals from background."""
 
     name = "separate"
+    inputs: List[str] = ["media/original_audio.wav"]
+    outputs: List[str] = ["media/speech.wav", "media/background.wav"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = []
+    config_fields: List[str] = ["model", "device", "out_dir_name"]
 
     def __init__(
         self,
@@ -101,13 +106,17 @@ class SeparateStage:
         model: str = "htdemucs",
         device: str = "cuda",
         out_dir_name: str = "separation",
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.model = model
         self.device = device
         self.out_dir = self.workdir / out_dir_name
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.workdir / "speech.wav", self.workdir / "background.wav"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

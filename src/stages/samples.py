@@ -264,18 +264,38 @@ def build_speaker_profiles(
 
 class SampleStage:
     name = "samples"
+    inputs: List[str] = ["media/speech.wav", "diarization/segments.json"]
+    outputs: List[str] = [
+        "speakers/speaker_01/primary.wav",
+        "speakers/speaker_01/primary.txt",
+        "speakers/speaker_01/embedding.npy",
+        "speakers/speaker_01/metadata.json",
+        "speakers/speaker_01/candidates/candidate_01.wav",
+        "speakers/speaker_01/candidates/candidate_01.txt",
+        "speakers/speaker_01/candidates/candidate_01.score.json",
+    ]
+    editable_outputs: List[str] = [
+        "speakers/speaker_01/primary.wav",
+        "speakers/speaker_01/primary.txt",
+    ]
+    derived_outputs: List[str] = []
+    config_fields: List[str] = ["target_seconds", "max_seconds"]
 
     def __init__(
         self,
         workdir: Path,
         target_seconds: float = 10.0,
         max_seconds: float = 15.0,
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.target_seconds = target_seconds
         self.max_seconds = max_seconds
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.workdir / "speaker_profiles", self.workdir / "speakers"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

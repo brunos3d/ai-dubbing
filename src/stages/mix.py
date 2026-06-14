@@ -66,13 +66,24 @@ def final_mix(
 
 class MixStage:
     name = "mix"
+    inputs: List[str] = [
+        "output/reconstructed_speech.wav",
+        "media/background.wav",
+    ]
+    outputs: List[str] = ["output/final_audio.wav"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = ["output/final_audio.wav"]
+    config_fields: List[str] = ["target_lufs", "speech_db", "background_db"]
 
-    def __init__(self, workdir: Path, output_dir: Path, target_lufs: float = -16.0):
+    def __init__(self, workdir: Path, output_dir: Path, target_lufs: float = -16.0, subdir: str | None = None):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.output_dir = Path(output_dir)
         self.target_lufs = target_lufs
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.output_dir / "final_audio.wav"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

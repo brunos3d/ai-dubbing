@@ -42,13 +42,21 @@ def remux_video(
 
 class VideoStage:
     name = "video"
+    inputs: List[str] = ["output/final_audio.wav"]
+    outputs: List[str] = ["output/final_video.mp4"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = ["output/final_video.mp4"]
+    config_fields: List[str] = []
 
-    def __init__(self, workdir: Path, output_dir: Path, input_path: str):
+    def __init__(self, workdir: Path, output_dir: Path, input_path: str, subdir: str | None = None):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.output_dir = Path(output_dir)
         self.input_path = Path(input_path)
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.output_dir / "final_video.mp4"]
 
     def run(self, context: Dict[str, Any]) -> Optional[Dict[str, Any]]:

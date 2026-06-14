@@ -291,6 +291,17 @@ def translate_segments(
 
 class TranslateStage:
     name = "translate"
+    inputs: List[str] = ["transcription/transcript.json"]
+    outputs: List[str] = [
+        "translation/translated_transcript.json",
+        "translation/glossary.json",
+    ]
+    editable_outputs: List[str] = [
+        "translation/translated_transcript.json",
+        "translation/glossary.json",
+    ]
+    derived_outputs: List[str] = []
+    config_fields: List[str] = ["source_language", "target_language", "backend_name"]
 
     def __init__(
         self,
@@ -300,8 +311,11 @@ class TranslateStage:
         glossary_path: Optional[Path] = None,
         backend: Optional[TranslationBackend] = None,
         backend_name: Optional[str] = None,
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.source_language = source_language
         self.target_language = target_language
         self.glossary_path = glossary_path
@@ -310,8 +324,9 @@ class TranslateStage:
         self.backend = backend or (
             make_backend(backend_name) if backend_name else make_backend()
         )
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.workdir / "translated_transcript.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

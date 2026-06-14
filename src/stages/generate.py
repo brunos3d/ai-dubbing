@@ -110,6 +110,11 @@ def _generate_one(
 
 class GenerateStage:
     name = "generate"
+    inputs: List[str] = ["translation/translated_transcript.json"]
+    outputs: List[str] = ["generated_segments/manifest.json"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = ["generated_segments/manifest.json"]
+    config_fields: List[str] = ["model_id", "target_language", "use_clone_prompt"]
 
     def __init__(
         self,
@@ -121,8 +126,11 @@ class GenerateStage:
         use_clone_prompt: bool = True,
         duration_tolerance: float = 0.10,
         offload_dir: str = "/tmp/opencode/omnivoice_offload",
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.model_id = model_id
         self.target_language = target_language
         self.device = device
@@ -130,8 +138,9 @@ class GenerateStage:
         self.use_clone_prompt = use_clone_prompt
         self.duration_tolerance = duration_tolerance
         self.offload_dir = offload_dir
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.out_dir]
 
     def _load_model(self):

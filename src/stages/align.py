@@ -139,6 +139,15 @@ def _regenerate_with_duration(
 
 class AlignStage:
     name = "align"
+    inputs: List[str] = ["generated_segments/manifest.json"]
+    outputs: List[str] = ["aligned_manifest.json"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = ["aligned_manifest.json"]
+    config_fields: List[str] = [
+        "target_language",
+        "tolerance",
+        "regenerate_with_duration",
+    ]
 
     def __init__(
         self,
@@ -147,14 +156,18 @@ class AlignStage:
         tolerance: float = 0.10,
         out_dir_name: str = "aligned_segments",
         regenerate_with_duration: bool = False,
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.target_language = target_language
         self.tolerance = tolerance
         self.out_dir = self.workdir / out_dir_name
         self.regenerate_with_duration = regenerate_with_duration
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.out_dir, self.workdir / "aligned_manifest.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

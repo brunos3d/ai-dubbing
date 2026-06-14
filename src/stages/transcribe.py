@@ -298,6 +298,14 @@ def transcribe_audio(
 
 class TranscribeStage:
     name = "transcribe"
+    inputs: List[str] = ["media/speech.wav", "diarization/segments.json"]
+    outputs: List[str] = [
+        "transcription/transcript.json",
+        "transcription/word_level.json",
+    ]
+    editable_outputs: List[str] = ["transcription/transcript.json"]
+    derived_outputs: List[str] = []
+    config_fields: List[str] = ["model_size", "source_language", "device"]
 
     def __init__(
         self,
@@ -305,13 +313,17 @@ class TranscribeStage:
         model_size: str = "large-v3",
         source_language: Optional[str] = None,
         device: str = "cuda",
+        subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.model_size = model_size
         self.source_language = source_language
         self.device = device
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.workdir / "transcript.json", self.workdir / "transcript_word_level.json"]
 
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:

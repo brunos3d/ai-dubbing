@@ -54,12 +54,20 @@ def extract_audio(input_path: str, output_wav: str | Path, sample_rate: int = 16
 
 class ExtractStage:
     name = "extract"
+    inputs: List[str] = []
+    outputs: List[str] = ["media/original_audio.wav", "media_info.json"]
+    editable_outputs: List[str] = []
+    derived_outputs: List[str] = []
+    config_fields: List[str] = ["sample_rate"]
 
-    def __init__(self, workdir: Path, sample_rate: int = 16000):
+    def __init__(self, workdir: Path, sample_rate: int = 16000, subdir: str | None = None):
         self.workdir = Path(workdir)
+        if subdir:
+            self.workdir = self.workdir / subdir
         self.sample_rate = sample_rate
+        self.subdir = subdir
 
-    def outputs(self) -> List[Path]:
+    def output_paths(self) -> List[Path]:
         return [self.workdir / "original_audio.wav", self.workdir / "media_info.json"]
 
     def run(self, input_path: str, context: Dict[str, Any]) -> Dict[str, Any]:
