@@ -61,6 +61,8 @@ class Pipeline:
         read_only_cache: bool = False,
         glossary_path: Optional[Path] = None,
         no_pyannote: bool = False,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
     ):
         global LOG
         env()
@@ -77,6 +79,8 @@ class Pipeline:
         self.read_only_cache = read_only_cache
         self.glossary_path = glossary_path
         self.no_pyannote = no_pyannote
+        self.min_speakers = min_speakers
+        self.max_speakers = max_speakers
 
         # Cache resolution
         self.cache_manager = CacheManager()
@@ -144,7 +148,13 @@ class Pipeline:
         if name == "separate":
             return SeparateStage(self.workdir)
         if name == "diarize":
-            return DiarizeStage(self.workdir, hf_token=self.hf_token, no_pyannote=self.no_pyannote)
+            return DiarizeStage(
+                self.workdir,
+                hf_token=self.hf_token,
+                no_pyannote=self.no_pyannote,
+                min_speakers=self.min_speakers,
+                max_speakers=self.max_speakers,
+            )
         if name == "samples":
             return SampleStage(self.workdir)
         if name == "transcribe":

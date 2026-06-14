@@ -52,6 +52,18 @@ def build_parser() -> argparse.ArgumentParser:
         "is only needed when pyannote is unavailable (e.g. the HF "
         "account has not been granted access to the gated models).",
     )
+    run_p.add_argument(
+        "--min-speakers", type=int, default=None,
+        help="Minimum number of speakers for the diarization stage. "
+        "When set, pyannote is forced to find at least this many "
+        "speakers; the re-clusterer will also refuse to reduce below "
+        "this floor.  Default: auto-detect.",
+    )
+    run_p.add_argument(
+        "--max-speakers", type=int, default=None,
+        help="Maximum number of speakers for the diarization stage. "
+        "Default: 8 (or the user-specified value of --min-speakers + 6).",
+    )
 
     out = run_p.add_argument_group("output formats (default: produce the full dubbed video)")
     out.add_argument(
@@ -203,6 +215,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         read_only_cache=args.read_only_cache,
         glossary_path=Path(args.glossary).resolve() if args.glossary else None,
         no_pyannote=args.no_pyannote,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
     )
     try:
         pipeline.run(start_from=args.start_from, only=args.only)
