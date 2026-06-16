@@ -32,14 +32,15 @@ By default the dub script delivers the full dubbed video next to the input file.
 3. **Speaker Diarization** — pyannote.audio
 4. **Reference Sample Extraction** — Quality-based selection (8–12 s)
 5. **Speech Recognition** — faster-whisper (large-v3) with low-confidence re-verification
-6. **Translation** — `deep-translator` (Google → MyMemory fallback). Translation is dispatched through a pluggable `TranslationBackend` interface so future self-hosted models (NLLB, Marian, M2M100, Whisper) can be added without touching pipeline internals.
-7. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice)
-8. **Duration Alignment** — FFmpeg `atempo` (librosa fallback)
-9. **Timeline Reconstruction** — overlay + background mix
-10. **Final Mix** — FFmpeg with EBU R128 loudness normalization
+6. **Timing-aware Translation** — `deep-translator` (Google → MyMemory fallback) through a pluggable `TranslationBackend`. Multiple candidates are generated per line; each is scored on **estimated spoken duration**, rate naturalness, fidelity, and glossary compliance, and the best-fitting candidate is chosen — so a translation that fits the slot is preferred over stretching audio. See [Timing-aware dubbing](docs/timing-aware-dubbing.md).
+7. **Voice Generation** — OmniVoice (k2-fsa/OmniVoice), conditioned on a source-derived **prosody `speed`**, with **segment-level re-rendering** (only changed segments are re-synthesized).
+8. **Duration Alignment** — FFmpeg `atempo` (librosa fallback), now the *single* duration-correction authority and rarely triggered thanks to timing-aware translation.
+9. **Timeline Reconstruction** — overlay + background mix, with per-segment **prosody gain** preserving emphasis.
+10. **Final Mix** — FFmpeg with EBU R128 loudness normalization, **dynamic ducking** (sidechain) and **light room matching**.
 11. **Optional Video** — remux dubbed audio onto the original video
 
-- **Two-phase workflow** — `prepare` runs stages 1–6 (analysis); `generate` runs stages 7–11 (synthesis). The split lets you inspect, edit, and resume a workspace without re-running the heavy analysis stages. See [Workspaces](docs/workspaces.md).
+- **Two-phase workflow** — `prepare` runs stages 1–6 (analysis); `generate` runs stages 7–11 (synthesis). The split lets you inspect, edit, and resume a workspace without re-running the heavy analysis stages. `WorkspacePipeline` is the single orchestrator (the legacy `Pipeline` is a thin compatibility shim). See [Workspaces](docs/workspaces.md).
+- **Canonical Timeline** — every run writes a derived `timeline.json` (per-segment speaker/text/timing/prosody/generation/review). See [Timing-aware dubbing](docs/timing-aware-dubbing.md).
 
 ## Workspaces
 
