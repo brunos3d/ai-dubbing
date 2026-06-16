@@ -146,7 +146,9 @@ EXPECTED: dict[type, dict] = {
         "outputs": ["output/final_audio.wav"],
         "editable_outputs": [],
         "derived_outputs": ["output/final_audio.wav"],
-        "config_fields": ["target_lufs", "speech_db", "background_db"],
+        "config_fields": [
+            "target_lufs", "speech_db", "background_db", "ducking", "room_match",
+        ],
     },
     VideoStage: {
         "inputs": ["output/final_audio.wav"],
