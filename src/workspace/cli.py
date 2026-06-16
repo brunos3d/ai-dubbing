@@ -154,6 +154,20 @@ def cmd_workspace_inspect(args) -> int:
         rec = manifest.stages[name]
         duration = f"{rec.duration_s:.2f}" if rec.duration_s is not None else "-"
         print(f"{name:<14}  {rec.status:<10}  {duration:>12}")
+
+    # Timeline v1 summary (derived; present once translate has run).
+    from .timeline import Timeline
+
+    tl = Timeline.load(root / "timeline.json")
+    if tl is not None:
+        s = tl.summary()
+        print()
+        print("Timeline:")
+        print(f"  language pair      : {tl.language_pair}")
+        print(f"  segments           : {s['segments']}")
+        print(f"  generated / reused : {s['generated']} / {s['reused']}")
+        print(f"  flagged for review : {s['flagged_for_review']}")
+        print(f"  mean timing score  : {s['mean_timing_score']}")
     return 0
 
 
