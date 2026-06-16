@@ -27,6 +27,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..timing.score import select_candidate
 from ..utils.entities import EntityPreserver
 from ..utils.logging import get_logger, stage_banner
 from ..utils.vram import free_vram, log_vram
@@ -53,6 +54,20 @@ class TranslationBackend(ABC):
     @abstractmethod
     def translate(self, text: str, source: str, target: str) -> str:
         """Translate ``text`` from ISO-639-1 ``source`` to ``target``."""
+
+    def translate_candidates(
+        self, text: str, source: str, target: str
+    ) -> List[tuple]:
+        """Return one or more ``(candidate_text, backend_label)`` tuples.
+
+        The default implementation yields a single candidate from
+        :meth:`translate`.  Backends that can produce multiple distinct
+        renderings (e.g. several online providers, or beam variants) override
+        this so the timing-aware selector has a real choice.  Failures are the
+        caller's concern — a backend may return an empty list and the caller
+        falls back to the protected original.
+        """
+        return [(self.translate(text, source, target), self.name)]
 
 
 class DeepTranslatorBackend(TranslationBackend):
@@ -110,6 +125,29 @@ class DeepTranslatorBackend(TranslationBackend):
         raise RuntimeError(
             f"All {self.name} providers {self.providers!r} failed: {last_err}"
         )
+
+    def translate_candidates(self, text: str, source: str, target: str) -> List[tuple]:
+        """Collect one candidate per provider (deduplicated).
+
+        Each configured provider (Google, MyMemory) renders the line; the
+        distinct outputs become the candidate set the timing selector ranks.
+        A provider that errors is simply skipped.  If *every* provider fails
+        the list is empty and the caller keeps the protected original.
+        """
+        out: List[tuple] = []
+        seen: set = set()
+        for provider in self.providers:
+            try:
+                translator = self._make_translator(provider, source, target)
+                result = translator.translate(text)
+            except Exception as exc:  # noqa: BLE001 - provider hiccup, try next
+                LOG.debug(f"candidate provider {provider} failed: {exc}")
+                time.sleep(self.per_provider_sleep)
+                continue
+            if result and result.strip() and result.strip().lower() not in seen:
+                seen.add(result.strip().lower())
+                out.append((result.strip(), f"{self.name}:{provider}"))
+        return out
 
 
 class MarianBackend(TranslationBackend):
@@ -222,6 +260,7 @@ def translate_segments(
     total = len(segments)
     backend_ok = 0
     backend_fail = 0
+    stretch_needed = 0
 
     for i, seg in enumerate(segments):
         text = (seg.get("text") or "").strip()
@@ -232,49 +271,80 @@ def translate_segments(
             out.append(dict(seg))
             continue
 
+        # The original line's span is the timing slot the translation must
+        # fit (Phase 2): translated speech should land close to this many
+        # seconds without forcing the synthesizer to rush or drag.
+        slot = max(0.001, float(seg.get("end", 0.0)) - float(seg.get("start", 0.0)))
+
         # 1. Protect entities ONLY if a glossary was supplied. When the
         #    glossary is empty, the preserver is a pass-through and the
         #    translator sees the original text verbatim.
         protected = preserver.protect(text)
+        # The surface strings the selector should check for glossary
+        # compliance: the restore target for each protected term.
+        glossary_terms = [
+            preserver._restore_target(t) for t in preserver.glossary
+        ] if preserver.is_active else []
 
-        # 2. Translate through the active backend.
-        translated: Optional[str] = None
+        # 2. Collect translation candidates from the backend.
         used_backend = False
         try:
-            translated = backend.translate(protected, src, tgt)
-            used_backend = True
-            backend_ok += 1
-        except Exception as backend_exc:
-            backend_fail += 1
+            raw_candidates = backend.translate_candidates(protected, src, tgt)
+            used_backend = bool(raw_candidates)
+        except Exception as backend_exc:  # noqa: BLE001
             LOG.error(
                 f"Backend {backend.name!r} failed for segment {i}: {backend_exc}. "
                 f"Keeping original text for this segment; the pipeline will "
                 f"continue so a single bad segment does not abort the run."
             )
-            translated = protected  # fall back to the protected original
+            raw_candidates = []
 
-        # 3. Restore entities. No-op when no glossary was supplied.
-        final_text = preserver.restore(translated)
+        if used_backend:
+            backend_ok += 1
+        else:
+            backend_fail += 1
+            raw_candidates = [(protected, "passthrough")]
 
-        # 4. Length-diagnostics: warn on suspicious length ratios so a
-        #    backend regression is obvious in the logs without failing
-        #    the run.
-        src_words = len(text.split())
-        tgt_words = len(final_text.split())
-        if src_words > 0:
-            ratio = tgt_words / src_words
-            if ratio > 2.0 or ratio < 0.5:
-                LOG.warning(
-                    f"Segment {i + 1}: translation length anomaly "
-                    f"({src_words} -> {tgt_words} words, ratio {ratio:.2f})"
-                )
+        # 3. Restore entities on every candidate (no-op without a glossary).
+        candidates = [(preserver.restore(c), b) for c, b in raw_candidates]
+
+        # 4. Rank candidates by the timing score and pick the best fit
+        #    (Phase 2.3/2.4 — prefer a fitting translation over stretching).
+        best, all_scores = select_candidate(
+            candidates, slot, source_text=text, lang=tgt, glossary_terms=glossary_terms,
+        )
+        if best is None:
+            final_text = preserver.restore(protected)
+            timing = {
+                "slot_duration_s": round(slot, 3),
+                "estimated_duration_s": None,
+                "speaking_rate_factor": None,
+                "score": None,
+                "n_candidates": 0,
+            }
+        else:
+            final_text = best.text
+            timing = {
+                "slot_duration_s": round(slot, 3),
+                "estimated_duration_s": round(best.estimated_duration_s, 3),
+                "speaking_rate_factor": round(best.rate_factor, 3),
+                "score": round(best.score, 3),
+                "n_candidates": len(all_scores),
+            }
+            # The selected candidate needs stretching only when its implied
+            # speaking-rate factor leaves the natural band.
+            if best.rate_penalty > 0.0:
+                stretch_needed += 1
 
         new = dict(seg)
         new["source_text"] = text
         new["text"] = final_text
+        new["timing"] = timing
+        if best is not None and len(all_scores) > 1:
+            new["translation_candidates"] = [c.to_dict() for c in all_scores]
         if preserver.placeholders:
             new["entities_preserved"] = list(preserver.placeholders.values())
-        new["translation_backend"] = backend.name if used_backend else "passthrough"
+        new["translation_backend"] = best.backend if best else "passthrough"
         out.append(new)
 
         if (i + 1) % 10 == 0 or i == total - 1:
@@ -283,7 +353,8 @@ def translate_segments(
     if total:
         LOG.info(
             f"Translation summary: backend={backend.name} "
-            f"ok={backend_ok}/{total} passthrough={backend_fail}/{total}"
+            f"ok={backend_ok}/{total} passthrough={backend_fail}/{total} "
+            f"segments_needing_stretch={stretch_needed}/{total}"
         )
 
     return out
@@ -295,12 +366,15 @@ class TranslateStage:
     outputs: List[str] = [
         "translation/translated_transcript.json",
         "translation/glossary.json",
+        "translation/timing_report.json",
     ]
     editable_outputs: List[str] = [
         "translation/translated_transcript.json",
         "translation/glossary.json",
     ]
-    derived_outputs: List[str] = []
+    # The timing report is a derived diagnostic — a side-effect of the
+    # translate stage, never part of the invalidation lineage.
+    derived_outputs: List[str] = ["translation/timing_report.json"]
     config_fields: List[str] = ["source_language", "target_language", "backend_name"]
 
     def __init__(
@@ -353,6 +427,63 @@ class TranslateStage:
 
         out_path.write_text(json.dumps(translated, indent=2, ensure_ascii=False))
         LOG.info(f"Translated transcript -> {out_path} ({len(translated)} segments)")
+
+        # Build the timing report (spec §2.5) from the per-segment timing
+        # metadata the selector attached above.
+        report_path = self.workdir / "timing_report.json"
+        self._write_timing_report(report_path, translated)
+
         log_vram(LOG)
         free_vram()
-        return {"translated_path": str(out_path), "num_segments": len(translated)}
+        return {
+            "translated_path": str(out_path),
+            "timing_report_path": str(report_path),
+            "num_segments": len(translated),
+        }
+
+    def _write_timing_report(self, report_path: Path, translated: List[Dict[str, Any]]) -> None:
+        """Write ``translation/timing_report.json`` and log a short summary."""
+        rows = []
+        scores: List[float] = []
+        stretch = 0
+        spoken = 0
+        for seg in translated:
+            t = seg.get("timing")
+            if not t:
+                continue
+            spoken += 1
+            row = {
+                "speaker": seg.get("speaker"),
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "slot_duration_s": t.get("slot_duration_s"),
+                "estimated_duration_s": t.get("estimated_duration_s"),
+                "speaking_rate_factor": t.get("speaking_rate_factor"),
+                "score": t.get("score"),
+                "n_candidates": t.get("n_candidates"),
+                "selected_text": seg.get("text"),
+            }
+            if seg.get("translation_candidates"):
+                row["candidates"] = seg["translation_candidates"]
+            rows.append(row)
+            if isinstance(t.get("score"), (int, float)):
+                scores.append(float(t["score"]))
+            rf = t.get("speaking_rate_factor")
+            if isinstance(rf, (int, float)) and not (0.90 <= rf <= 1.15):
+                stretch += 1
+        mean_score = round(sum(scores) / len(scores), 3) if scores else None
+        report = {
+            "$schema_version": 1,
+            "language_pair": f"{self.source_language}->{self.target_language}",
+            "summary": {
+                "n_segments": spoken,
+                "mean_score": mean_score,
+                "segments_needing_stretch": stretch,
+            },
+            "segments": rows,
+        }
+        report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False))
+        LOG.info(
+            f"Timing report -> {report_path} "
+            f"(mean_score={mean_score}, needing_stretch={stretch}/{spoken})"
+        )
