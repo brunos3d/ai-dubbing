@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,13 @@ import torch
 from ..utils.audio import read_wav, write_wav
 from ..utils.logging import get_logger, stage_banner
 from ..utils.vram import free_vram, log_vram
+from ..workspace.atomic import sha256_file
+from ..workspace.timeline import segment_render_key
+
+# Canonical sample rate for preserved (non-speech) and reused clips, used
+# before the (lazily-loaded) TTS model is available.  OmniVoice's own output
+# rate (usually also 24 kHz) is used for freshly synthesized segments.
+_DEFAULT_SR = 24000
 
 LOG = get_logger("ai-dubbing.generate")
 
@@ -255,34 +263,89 @@ class GenerateStage:
                     pass
                 free_vram()
 
-        LOG.info(f"Loading OmniVoice ({self.model_id}) on {self.device}")
-        model = self._load_model()
-        sample_rate = int(getattr(model, "sampling_rate", 24000))
+        # --- Segment-level reuse (spec Phase 4) ----------------------------
+        # A per-speaker voice hash (cheap: one hash per reference) plus the
+        # previous run's manifest let us compute a stable render_key per
+        # segment and skip re-synthesizing any segment whose inputs are
+        # unchanged.  Editing one translated line re-renders one segment;
+        # everything else is reused.  If *nothing* needs synthesizing the
+        # OmniVoice model is never loaded at all.
+        voice_hash: Dict[str, str] = {}
+        for spk, d in speaker_profiles.items():
+            ref = d["profiles"]["primary"].get("reference")
+            try:
+                voice_hash[spk] = sha256_file(Path(ref))[:16] if ref else ""
+            except OSError:
+                voice_hash[spk] = ""
+
+        prev_by_key: Dict[str, Dict[str, Any]] = {}
+        prev_manifest_path = self.out_dir / "manifest.json"
+        if prev_manifest_path.exists():
+            try:
+                for e in json.loads(prev_manifest_path.read_text(encoding="utf-8")):
+                    rk, p = e.get("render_key"), e.get("path")
+                    if rk and p and Path(p).exists():
+                        prev_by_key[rk] = e
+            except (json.JSONDecodeError, OSError):
+                prev_by_key = {}
+
+        def _render_key(seg: Dict[str, Any], speaker: str) -> str:
+            txt = (seg.get("text") or "").strip()
+            marker = ("[nonspeech]" + txt) if seg.get("is_non_speech") else txt
+            slot = float(seg.get("end", 0.0)) - float(seg.get("start", 0.0))
+            return segment_render_key(
+                target_text=marker,
+                speaker=speaker,
+                target_language=self.target_language,
+                voice_profile_hash=voice_hash.get(speaker, ""),
+                tts_model_id=self.model_id,
+                slot_duration_s=slot,
+                prosody_signature=str(seg.get("prosody_signature", "")),
+            )
 
         manifest: List[Dict[str, Any]] = []
+        model = None
+        model_sr = _DEFAULT_SR
+        reused_count = 0
+        synth_count = 0
+
         for i, seg in enumerate(segments):
             text = (seg.get("text") or "").strip()
             speaker = seg.get("speaker", speakers[0])
+            if speaker not in speaker_profiles:
+                speaker = speakers[0]
             start_s = float(seg.get("start", 0.0))
             end_s = float(seg.get("end", 0.0))
             orig_duration = end_s - start_s
-            
-            if speaker not in speaker_profiles:
-                speaker = speakers[0]
-
             out_wav = self.out_dir / f"segment_{i + 1:04d}.wav"
-            
+            rkey = _render_key(seg, speaker)
+
+            # --- Reuse an unchanged segment from a previous run ---
+            reuse = prev_by_key.get(rkey)
+            if reuse is not None:
+                prior = Path(reuse["path"])
+                if prior.resolve() != out_wav.resolve() and prior.exists():
+                    shutil.copy2(prior, out_wav)
+                entry = dict(reuse)
+                entry.update({
+                    "index": i, "speaker": speaker, "start": start_s, "end": end_s,
+                    "path": str(out_wav), "render_key": rkey, "reused": True,
+                })
+                manifest.append(entry)
+                reused_count += 1
+                LOG.info(f"Segment {i + 1:>3}: REUSED (render_key {rkey})")
+                continue
+
             # --- Non-Speech Preservation ---
             if seg.get("is_non_speech"):
                 LOG.info(f"Segment {i + 1:>3}: PRESERVING ORIGINAL (non-speech event: {text})")
                 s0 = int(start_s * full_sr)
                 s1 = int(end_s * full_sr)
                 clip = full_audio[s0:s1]
-                if full_sr != sample_rate:
+                if full_sr != _DEFAULT_SR:
                     from ..utils.audio import resample
-                    clip = resample(clip, full_sr, sample_rate)
-                sf.write(str(out_wav), clip, sample_rate, subtype="PCM_16")
-                
+                    clip = resample(clip, full_sr, _DEFAULT_SR)
+                sf.write(str(out_wav), clip, _DEFAULT_SR, subtype="PCM_16")
                 manifest.append({
                     "index": i,
                     "speaker": speaker,
@@ -291,13 +354,21 @@ class GenerateStage:
                     "start": start_s,
                     "end": end_s,
                     "original_duration": round(orig_duration, 3),
-                    "generated_duration": round(len(clip) / sample_rate, 3),
+                    "generated_duration": round(len(clip) / _DEFAULT_SR, 3),
                     "path": str(out_wav),
+                    "sample_rate": _DEFAULT_SR,
+                    "render_key": rkey,
+                    "reused": False,
                 })
                 continue
 
-            # --- Stable Identity Generation ---
-            # We always use the 'primary' profile for each speaker to ensure stability.
+            # --- Stable Identity Generation (lazy-load the TTS model) ---
+            if model is None:
+                LOG.info(f"Loading OmniVoice ({self.model_id}) on {self.device}")
+                model = self._load_model()
+                model_sr = int(getattr(model, "sampling_rate", _DEFAULT_SR))
+
+            # We always use the 'primary' profile for each speaker for stability.
             prof_data = speaker_profiles[speaker]["profiles"]["primary"]
             ref_audio_path = prof_data["reference"]
             ref_transcript = ref_transcripts.get(speaker, "")
@@ -308,12 +379,15 @@ class GenerateStage:
             )
 
             wav, sr = _coerce_ref_audio(ref_audio_path)
+            # Honour a prosody-derived speed when present (Phase 5); default 1.0.
+            speed = float(seg.get("prosody_speed", 1.0) or 1.0)
             kwargs: Dict[str, Any] = {
                 "text": text,
                 "language": _lang_name(self.target_language),
                 "ref_audio": (wav, sr),
                 "ref_text": ref_transcript or None,
                 "duration": float(orig_duration),
+                "speed": speed,
             }
 
             try:
@@ -326,16 +400,16 @@ class GenerateStage:
                     ref_audio=(wav, sr),
                     ref_text=ref_transcript or None,
                 )
-            
+
             if not audios:
                 raise RuntimeError(f"OmniVoice produced no audio for segment {i + 1}")
-            
+
             audio = audios[0]
             if isinstance(audio, torch.Tensor):
                 audio = audio.detach().cpu().numpy()
             audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-            sf.write(str(out_wav), audio, sample_rate, subtype="PCM_16")
-            gen_duration = float(audio.shape[0]) / sample_rate
+            sf.write(str(out_wav), audio, model_sr, subtype="PCM_16")
+            gen_duration = float(audio.shape[0]) / model_sr
 
             manifest.append({
                 "index": i,
@@ -349,12 +423,19 @@ class GenerateStage:
                 "original_duration": round(orig_duration, 3),
                 "generated_duration": round(gen_duration, 3),
                 "path": str(out_wav),
-                "sample_rate": sample_rate,
+                "sample_rate": model_sr,
+                "render_key": rkey,
+                "reused": False,
             })
+            synth_count += 1
 
             if (i + 1) % 5 == 0 or i == len(segments):
                 LOG.info(f"Generated {i + 1}/{len(segments)} segments")
 
+        LOG.info(
+            f"Generation plan: synthesized={synth_count} reused={reused_count} "
+            f"total={len(segments)}"
+        )
         manifest_path = self.out_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
 
