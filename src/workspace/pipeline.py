@@ -53,6 +53,7 @@ from .content_hash import content_hash as _content_hash, pipeline_config_hash
 from .dag import CliOverrides, STAGE_ORDER, compute_stale_set
 from .manifest import ArtifactRef, Manifest, StageRecord
 from .paths import slugify, workspace_id, workspaces_root
+from .timeline import refresh_timeline
 
 LOG = get_logger("ai-dubbing.workspace")
 
@@ -618,7 +619,16 @@ class WorkspacePipeline:
         # a real baseline to diff against.
         self._backfill_manifest_from_disk(manifest, root)
         manifest.save(root / "manifest.json")
+        self._refresh_timeline(root)
         return wid, root
+
+    def _refresh_timeline(self, root: Path) -> None:
+        """Rebuild the derived ``timeline.json`` (best-effort; never fatal)."""
+        try:
+            tl = refresh_timeline(root)
+            LOG.info("timeline.json refreshed: %s", tl.summary())
+        except Exception as exc:  # noqa: BLE001 - the Timeline is derived/optional
+            LOG.warning("Could not refresh timeline.json: %s", exc)
 
     def _hydrate_from_metadata(self, root: Path) -> None:
         """Hydrate pipeline attributes from metadata.json."""
@@ -684,8 +694,10 @@ class WorkspacePipeline:
         stale = compute_stale_set(manifest, root, overrides, current_configs=current_configs)
         if not stale:
             LOG.info("Nothing to do: no stale stages for %s", workspace_id_str)
+            self._refresh_timeline(root)
             return workspace_id_str, root
         self._run_stages(manifest, stale, start_at=stale[0], workspace_root=root)
+        self._refresh_timeline(root)
         return workspace_id_str, root
 
     def run_oneshot(
