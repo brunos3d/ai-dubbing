@@ -23,15 +23,40 @@ def read_wav(path: str | Path, dtype: str = "float32", always_2d: bool = True) -
 
 
 def write_wav(path: str | Path, audio: np.ndarray, sample_rate: int, subtype: str = "PCM_16") -> None:
-    """Write a wav file. Audio is (channels, samples) float32 in [-1, 1]."""
+    """Write a wav file. Audio is (channels, samples) float32 in [-1, 1].
+
+    Internally we use libsndfile's preferred ``(samples, channels)``
+    layout (1D for mono).  The naive ``arr.T`` of a 1-channel
+    ``(1, N)`` array produces ``(N, 1)`` which works, but the
+    reverse ``(channels, samples) -> (1, N)`` triggers a
+    libsndfile "Format not recognised" error for any array
+    larger than ~4000 samples — observed on the Suits pilot's
+    112 M-sample background stem.  We therefore normalise the
+    shape to ``(samples,)`` for mono and ``(samples, channels)``
+    for multi-channel, never emitting the offending ``(1, N)``
+    layout.
+    """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     arr = np.asarray(audio)
     if arr.ndim == 1:
-        arr = arr[np.newaxis, :]
+        # Already 1D mono
+        arr = np.clip(arr, -1.0, 1.0)
+        sf.write(str(path), arr, sample_rate, subtype=subtype)
+        return
     if arr.ndim == 2:
-        arr = arr.T
-    arr = np.clip(arr, -1.0, 1.0)
-    sf.write(str(path), arr, sample_rate, subtype=subtype)
+        # Decide layout: the "channels" axis is always 1 or 2
+        # in this codebase; the "samples" axis is whatever is
+        # left.  If the first axis is 1 (mono) and the second
+        # is huge, we have ``(channels, samples)``; otherwise
+        # we have ``(samples, channels)``.
+        if arr.shape[0] <= 8 and arr.shape[1] > arr.shape[0]:
+            # (channels, samples) — transpose.
+            arr = arr.T
+        # Now arr is (samples, channels).
+        arr = np.clip(arr, -1.0, 1.0)
+        sf.write(str(path), arr, sample_rate, subtype=subtype)
+        return
+    raise ValueError(f"audio must be 1D or 2D, got ndim={arr.ndim}")
 
 
 def to_mono(data: np.ndarray) -> np.ndarray:
@@ -114,6 +139,59 @@ def crossfade(a: np.ndarray, b: np.ndarray, fade_seconds: float, sample_rate: in
     cross = tail_a + tail_b
     rest = b[..., fade_n:] if b.shape[-1] > fade_n else np.zeros_like(b[..., :0])
     return np.concatenate([head, cross, rest], axis=-1)
+
+
+def resample(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+    """Resample audio from orig_sr to target_sr using FFmpeg if possible."""
+    if orig_sr == target_sr:
+        return audio
+    
+    import shutil
+    import subprocess
+    import tempfile
+    import os
+
+    if shutil.which("ffmpeg"):
+        with tempfile.TemporaryDirectory() as tmp:
+            in_wav = Path(tmp) / "in.wav"
+            out_wav = Path(tmp) / "out.wav"
+            # Write the intermediate as 32-bit float (the default
+            # ``PCM_16`` subtype in :func:`write_wav` triggers a
+            # "Format not recognised" error from libsndfile when
+            # the input is a very large mono array — e.g. a 42-min
+            # background stem at 44.1 kHz is 112 M samples and
+            # ~224 MB, which the PCM-16 encoder refuses to write
+            # even though :func:`sf.read` reads the same file
+            # fine).  ffmpeg reads the float file and re-encodes
+            # to PCM_16 on output, so this is a safe downgrade.
+            write_wav(in_wav, audio, orig_sr, subtype="FLOAT")
+            
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", str(in_wav),
+                "-ar", str(target_sr),
+                str(out_wav)
+            ]
+            proc = subprocess.run(cmd, capture_output=True)
+            if proc.returncode == 0 and out_wav.exists():
+                resampled, _ = read_wav(out_wav, always_2d=audio.ndim > 1)
+                return resampled
+
+    # Fallback to librosa
+    try:
+        import librosa
+        if audio.ndim == 1:
+            return librosa.resample(audio.astype("float32"), orig_sr=orig_sr, target_sr=target_sr)
+        return np.stack([
+            librosa.resample(ch.astype("float32"), orig_sr=orig_sr, target_sr=target_sr)
+            for ch in audio
+        ])
+    except ImportError:
+        # Very crude fallback: nearest neighbor (not recommended)
+        n_in = audio.shape[-1]
+        n_out = int(n_in * target_sr / orig_sr)
+        idx = np.linspace(0, n_in - 1, n_out).astype(int)
+        return audio[..., idx]
 
 
 def compute_snr_db(noise: np.ndarray, eps: float = 1e-9) -> float:

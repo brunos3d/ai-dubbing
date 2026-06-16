@@ -20,6 +20,7 @@ def _reverify_low_confidence(
     device: str,
     compute_type: str,
     threshold: float = -0.8,
+    model: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Re-transcribe a low-confidence segment with higher effort (larger beam)."""
     if segment.get("avg_logprob", 0.0) >= threshold:
@@ -29,12 +30,19 @@ def _reverify_low_confidence(
 
     LOG.info(f"Re-verifying low-confidence segment ({segment['avg_logprob']:.2f}): {segment['text'][:50]}...")
     
+    local_model = False
+    if model is None:
+        try:
+            model = WhisperModel(model_size, device=device, compute_type=compute_type)
+            local_model = True
+        except Exception as exc:
+            LOG.warning(f"Failed to load re-verification model: {exc}")
+            return segment
+
     try:
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
         lang = None if (not language or language == "auto") else language
         
         # Crop audio to just this segment for focused re-verification
-        # (For now, we just run transcribe with restricted timestamps to avoid complex cropping)
         segs_iter, _ = model.transcribe(
             str(speech_path),
             language=lang,
@@ -57,11 +65,12 @@ def _reverify_low_confidence(
     except Exception as exc:
         LOG.warning(f"Re-verification failed: {exc}")
     finally:
-        try:
-            del model
-        except Exception:
-            pass
-        free_vram()
+        if local_model:
+            try:
+                del model
+            except Exception:
+                pass
+            free_vram()
         
     return segment
 
@@ -368,13 +377,26 @@ class TranscribeStage:
         LOG.info("Refining transcript (low-confidence re-verification)...")
 
         # 1. Re-verify low-confidence segments.
+        # We pre-load the model once for all re-verifications to avoid reload overhead.
+        from faster_whisper import WhisperModel
+        try:
+            rev_model = WhisperModel(self.model_size, device=self.device, compute_type=compute_type)
+        except Exception as exc:
+            LOG.warning(f"Could not load re-verification model: {exc}")
+            rev_model = None
+
         refined: List[Dict[str, Any]] = []
         for s in merged:
             rs = _reverify_low_confidence(
                 speech_path, s, self.model_size,
-                self.source_language, self.device, compute_type
+                self.source_language, self.device, compute_type,
+                model=rev_model,
             )
             refined.append(rs)
+
+        if rev_model:
+            del rev_model
+            free_vram()
 
         seg_path.write_text(json.dumps(refined, indent=2, ensure_ascii=False))
         LOG.info(f"Transcript: {len(refined)} utterances")

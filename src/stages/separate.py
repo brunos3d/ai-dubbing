@@ -16,38 +16,62 @@ LOG = get_logger("ai-dubbing.separate")
 
 def _separate_demucs_api(audio_path: Path, out_dir: Path, model: str, device: str) -> Dict[str, Path]:
     import torch
+    import os
 
     from demucs.pretrained import get_model
     from demucs.separate import apply_model, load_track, save_audio
 
-    LOG.info(f"Loading Demucs {model} ...")
-    demucs_model = get_model(model)
-    demucs_model.to(device)
+    # Suggestion from OOM error message
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    LOG.info(f"Loading Demucs {model} on {device} ...")
+    try:
+        demucs_model = get_model(model)
+        demucs_model.to(device)
+    except Exception as exc:
+        if "cuda" in str(device).lower():
+            LOG.warning(f"Failed to load Demucs on {device}: {exc}. Falling back to cpu.")
+            demucs_model = get_model(model)
+            demucs_model.to("cpu")
+            device = "cpu"
+        else:
+            raise
+
     demucs_model.eval()
 
+    LOG.info(f"Loading track {audio_path} ...")
     wav = load_track(str(audio_path), audio_channels=demucs_model.audio_channels, samplerate=demucs_model.samplerate)
-    if isinstance(wav, torch.Tensor):
-        wav_np = wav.cpu().numpy()
-    else:
-        wav_np = wav
-    ref = wav_np.mean(0)
-    wav_np = (wav_np - ref.mean()) / ref.std()
-    mix = torch.from_numpy(wav_np).to(device)
+    
+    # Move to device
+    mix = wav.to(device)
 
-    LOG.info("Running Demucs inference ...")
-    with torch.no_grad():
-        sources = apply_model(
-            demucs_model,
-            mix[None],
-            shifts=1,
-            num_workers=0,
-            progress=False,
-            device=device,
-            segment=7.0,
-        )[0]
+    LOG.info(f"Running Demucs inference (device={device}) ...")
+    try:
+        with torch.no_grad():
+            sources = apply_model(
+                demucs_model,
+                mix[None],
+                shifts=1,
+                num_workers=0,
+                progress=True,
+                device=device,
+                segment=7.0,
+            )[0]
+    except torch.OutOfMemoryError:
+        if "cuda" in str(device).lower():
+            LOG.warning("CUDA Out of Memory during inference. Falling back to cpu.")
+            free_vram()
+            return _separate_demucs_api(audio_path, out_dir, model, "cpu")
+        raise
 
-    sources = sources * ref.std() + ref.mean()
+    # Move back to CPU for saving if it was on GPU
     sources_list = sources.cpu().numpy()
+    # Also free the mix tensor
+    del mix
+    if "cuda" in str(device).lower():
+        free_vram()
+
     sr = demucs_model.samplerate
     out_dir.mkdir(parents=True, exist_ok=True)
     name_map = {"vocals": "speech.wav", "other": "background.wav", "drums": "drums.wav", "bass": "bass.wav"}
@@ -68,8 +92,10 @@ def _separate_demucs_api(audio_path: Path, out_dir: Path, model: str, device: st
 
 
 def _separate_demucs_cli(audio_path: Path, out_dir: Path, model: str, device: str) -> Dict[str, Path]:
+    import sys
+    # Try calling as a module to be robust to venv issues
     cmd = [
-        "demucs",
+        sys.executable, "-m", "demucs.separate",
         "-n", model,
         "--out", str(out_dir),
         "--device", device,
@@ -82,6 +108,9 @@ def _separate_demucs_cli(audio_path: Path, out_dir: Path, model: str, device: st
     LOG.info("Running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
+        if "cuda" in str(device).lower() and "out of memory" in proc.stderr.lower():
+            LOG.warning("Demucs CLI OOM on CUDA, retrying on cpu")
+            return _separate_demucs_cli(audio_path, out_dir, model, "cpu")
         raise RuntimeError(f"demucs failed: {proc.stderr[:2000]}")
     base = out_dir / model / audio_path.stem
     return {
@@ -131,8 +160,7 @@ class SeparateStage:
         except Exception as exc:
             LOG.warning(f"demucs.api failed ({exc}); falling back to CLI")
             free_vram()
-            if not shutil.which("demucs"):
-                raise RuntimeError("demucs CLI is not on PATH") from exc
+            # We don't check for shutil.which("demucs") anymore since we use sys.executable -m demucs.separate
             results = _separate_demucs_cli(audio_path, self.out_dir, self.model, self.device)
 
         speech_src = results.get("vocals")
