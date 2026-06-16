@@ -95,12 +95,13 @@ EXPECTED: dict[type, dict] = {
         "outputs": [
             "translation/translated_transcript.json",
             "translation/glossary.json",
+            "translation/timing_report.json",
         ],
         "editable_outputs": [
             "translation/translated_transcript.json",
             "translation/glossary.json",
         ],
-        "derived_outputs": [],
+        "derived_outputs": ["translation/timing_report.json"],
         "config_fields": ["source_language", "target_language", "backend_name"],
     },
     GenerateStage: {

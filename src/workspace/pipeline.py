@@ -108,6 +108,8 @@ _EDITABLE_PATHS: List[str] = [
 _DERIVED_PATHS: List[str] = [
     "diarization/embeddings.npz",
     "logs/pipeline.log",
+    "translation/timing_report.json",
+    "timeline.json",
 ]
 
 # Well-known context keys (spec §6) that all downstream stages read. The
