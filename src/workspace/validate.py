@@ -61,11 +61,46 @@ def _check_required_keys(
 
 _TRANSCRIPT_TOP_REQUIRED = ("$schema_version", "language", "segments")
 _SEGMENT_REQUIRED = ("id", "start", "end", "speaker", "text")
+# The runtime stages emit a *bare list* of segments (legacy/v0 shape) rather
+# than the richer ``{$schema_version, language, segments}`` v1 dict.  The
+# validators accept both so ``dub.sh workspace validate`` is truthful about
+# the artifacts the pipeline actually produces.  Bare-list segments are not
+# required to carry an ``id`` (the dict shape is); everything else matches.
+_LEGACY_SEGMENT_REQUIRED = ("start", "end", "speaker", "text")
+
+
+def _validate_segment_list(
+    segments: list, required: tuple[str, ...], issues: list[Issue]
+) -> None:
+    """Append issues for a bare list of segment dicts."""
+    for i, seg in enumerate(segments):
+        seg_path = f"$[{i}]"
+        if not isinstance(seg, dict):
+            issues.append(
+                Issue("error", seg_path, f"expected object, got {type(seg).__name__}")
+            )
+            continue
+        for key in required:
+            if key not in seg:
+                issues.append(
+                    Issue("error", f"{seg_path}.{key}", f"missing required key '{key}'")
+                )
+        if "text" in seg and not isinstance(seg["text"], str):
+            issues.append(
+                Issue(
+                    "error",
+                    f"{seg_path}.text",
+                    f"text must be a string, got {type(seg['text']).__name__}",
+                )
+            )
 
 
 def validate_transcript(data: Any) -> list[Issue]:
-    """Validate a transcript dict (spec §12 transcript format)."""
+    """Validate a transcript (v1 dict *or* legacy bare list of segments)."""
     issues: list[Issue] = []
+    if isinstance(data, list):
+        _validate_segment_list(data, _LEGACY_SEGMENT_REQUIRED, issues)
+        return issues
     if not _check_required_keys(data, _TRANSCRIPT_TOP_REQUIRED, "$", issues):
         return issues
     segments = data.get("segments")
@@ -116,6 +151,15 @@ def validate_translation(data: Any) -> list[Issue]:
     problems caught by :func:`validate_transcript`.
     """
     issues = validate_transcript(data)
+    if isinstance(data, list):
+        for i, seg in enumerate(data):
+            if not isinstance(seg, dict):
+                continue
+            if "source_text" not in seg:
+                issues.append(
+                    Issue("warning", f"$[{i}].source_text", "missing source_text")
+                )
+        return issues
     if not isinstance(data, dict):
         return issues
     segments = data.get("segments")
@@ -196,8 +240,11 @@ _DIARIZATION_SEGMENT_REQUIRED = ("start", "end", "speaker")
 
 
 def validate_diarization_segments(data: Any) -> list[Issue]:
-    """Validate a diarization segments dict (spec §12)."""
+    """Validate diarization segments (v1 dict *or* legacy bare list)."""
     issues: list[Issue] = []
+    if isinstance(data, list):
+        _validate_segment_list(data, _DIARIZATION_SEGMENT_REQUIRED, issues)
+        return issues
     if not _check_required_keys(data, _DIARIZATION_TOP_REQUIRED, "$", issues):
         return issues
     speakers = data.get("speakers")

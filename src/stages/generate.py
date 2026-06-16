@@ -54,6 +54,7 @@ def _coerce_ref_audio(path: str) -> tuple:
 def _transcribe_ref_with_whisper(
     ref_audio_path: str,
     source_language: Optional[str] = None,
+    model: Optional[Any] = None,
 ) -> str:
     """Transcribe the reference audio using faster-whisper to obtain a clean
     transcript.  This transcript is then passed as ``ref_text`` to OmniVoice so
@@ -61,20 +62,32 @@ def _transcribe_ref_with_whisper(
     """
     from faster_whisper import WhisperModel
 
-    LOG.info(f"Transcribing reference audio with faster-whisper (tiny) -> {ref_audio_path}")
+    local_model = False
+    if model is None:
+        LOG.info(f"Transcribing reference audio with faster-whisper (tiny) -> {ref_audio_path}")
+        try:
+            model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            local_model = True
+        except Exception as exc:
+            LOG.warning(f"Failed to load whisper tiny for reference: {exc}")
+            return "Reference audio for voice cloning."
+
     try:
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
         lang = source_language if source_language and source_language != "auto" else None
         segments, _ = model.transcribe(
             ref_audio_path, language=lang, beam_size=1, vad_filter=True,
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
+    except Exception as exc:
+        LOG.warning(f"Whisper transcription of {ref_audio_path} failed: {exc}")
+        text = ""
     finally:
-        try:
-            del model
-        except Exception:
-            pass
-        free_vram()
+        if local_model:
+            try:
+                del model
+            except Exception:
+                pass
+            free_vram()
     if not text:
         text = "Reference audio for voice cloning."
     return text
@@ -199,19 +212,48 @@ class GenerateStage:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         source_language = context.get("source_language")
         
-        # Pre-transcribe ALL primary profiles
+        # Resolve reference transcripts.  The samples stage already wrote a
+        # ``transcript.txt`` per speaker profile (surfaced here as
+        # ``transcript_text``), so in the common case no ASR is needed at
+        # all.  whisper-tiny is loaded *lazily* — only if some profile is
+        # missing its transcript — which avoids a redundant model load on
+        # every generate run (previously loaded unconditionally).
         ref_transcripts: Dict[str, str] = {}
-        for spk, spk_data in speaker_profiles.items():
-            p = spk_data["profiles"]["primary"]
-            if p.get("transcript_text"):
-                ref_transcripts[spk] = p["transcript_text"]
-            else:
+        missing = [
+            spk for spk, d in speaker_profiles.items()
+            if not d["profiles"]["primary"].get("transcript_text")
+        ]
+        whisper_tiny = None
+        if missing:
+            from faster_whisper import WhisperModel
+            try:
+                whisper_tiny = WhisperModel("tiny", device="cpu", compute_type="int8")
+            except Exception as exc:
+                LOG.warning(f"Could not load whisper tiny for reference transcription: {exc}")
+                whisper_tiny = None
+        else:
+            LOG.info("All speaker references already transcribed; skipping whisper-tiny load")
+
+        try:
+            for spk, spk_data in speaker_profiles.items():
+                p = spk_data["profiles"]["primary"]
+                if p.get("transcript_text"):
+                    ref_transcripts[spk] = p["transcript_text"]
+                else:
+                    try:
+                        ref_transcripts[spk] = _transcribe_ref_with_whisper(
+                            p["reference"], source_language, model=whisper_tiny
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        LOG.warning(f"Could not transcribe {spk} reference: {exc}")
+                        ref_transcripts[spk] = ""
+        finally:
+            if whisper_tiny:
                 try:
-                    ref_transcripts[spk] = _transcribe_ref_with_whisper(p["reference"], source_language)
-                except Exception as exc:  # noqa: BLE001
-                    LOG.warning(f"Could not transcribe {spk} reference: {exc}")
-                    ref_transcripts[spk] = ""
-        free_vram()
+                    del whisper_tiny
+                except Exception:
+                    pass
+                free_vram()
 
         LOG.info(f"Loading OmniVoice ({self.model_id}) on {self.device}")
         model = self._load_model()
@@ -237,8 +279,8 @@ class GenerateStage:
                 s1 = int(end_s * full_sr)
                 clip = full_audio[s0:s1]
                 if full_sr != sample_rate:
-                    import librosa
-                    clip = librosa.resample(clip.astype("float32"), orig_sr=full_sr, target_sr=sample_rate)
+                    from ..utils.audio import resample
+                    clip = resample(clip, full_sr, sample_rate)
                 sf.write(str(out_wav), clip, sample_rate, subtype="PCM_16")
                 
                 manifest.append({

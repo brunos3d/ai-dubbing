@@ -87,9 +87,9 @@ def reconstruct_timeline(
         bg_sr = target_sr
     else:
         if bg_sr != target_sr:
-            import librosa  # type: ignore
+            from ..utils.audio import resample
 
-            bg_data = librosa.resample(bg_data[0], orig_sr=bg_sr, target_sr=target_sr)[np.newaxis, :]
+            bg_data = resample(bg_data, bg_sr, target_sr)
             bg_sr = target_sr
 
     end_samples = int(round(max(
@@ -111,18 +111,16 @@ def reconstruct_timeline(
             continue
         seg_data, seg_sr = _load_mono(path)
         if seg_sr != bg_sr:
-            import librosa  # type: ignore
+            from ..utils.audio import resample
 
-            seg_data = librosa.resample(seg_data[0], orig_sr=seg_sr, target_sr=bg_sr)[np.newaxis, :]
+            seg_data = resample(seg_data, seg_sr, bg_sr)
             seg_sr = bg_sr
         start = int(round(float(entry.get("start", 0.0)) * bg_sr))
-        end = int(round(float(entry.get("end", entry.get("start", 0.0) + seg_data.shape[-1] / bg_sr)) * bg_sr))
-        target_dur = max(0.1, (end - start) / bg_sr)
-        if seg_data.shape[-1] / bg_sr > target_dur * 1.4 and target_dur > 0.4:
-            from ..utils.audio import time_stretch
-
-            rate = (seg_data.shape[-1] / bg_sr) / target_dur
-            seg_data = time_stretch(seg_data, rate=rate)
+        # NOTE: the align stage (src/stages/align.py) is the single
+        # duration-correction authority.  Reconstruct only *places* the
+        # (already duration-corrected) segment on the timeline — a second
+        # time-stretch here used to stack a lossy resampling pass on top of
+        # align's, degrading quality.  Removed deliberately (spec §1C).
         speech_timeline = _mix_additive(speech_timeline, seg_data, start)
         used_segments += 1
 
