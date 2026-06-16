@@ -10,6 +10,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
+from ..timing.prosody import analyze_segment, compute_gain, compute_speed
 from ..utils.audio import read_wav, write_wav
 from ..utils.logging import get_logger, stage_banner
 from ..utils.vram import free_vram, log_vram
@@ -132,9 +133,15 @@ def _generate_one(
 class GenerateStage:
     name = "generate"
     inputs: List[str] = ["translation/translated_transcript.json"]
-    outputs: List[str] = ["generated_segments/manifest.json"]
+    outputs: List[str] = [
+        "generated_segments/manifest.json",
+        "generated_segments/prosody.json",
+    ]
     editable_outputs: List[str] = []
-    derived_outputs: List[str] = ["generated_segments/manifest.json"]
+    derived_outputs: List[str] = [
+        "generated_segments/manifest.json",
+        "generated_segments/prosody.json",
+    ]
     config_fields: List[str] = ["model_id", "target_language", "use_clone_prompt"]
 
     def __init__(
@@ -262,6 +269,45 @@ class GenerateStage:
                 except Exception:
                     pass
                 free_vram()
+
+        # --- Prosody analysis (spec Phase 5) -------------------------------
+        # Pull cheap delivery cues out of the source speech so synthesis can
+        # match tempo (TTS speed) and reconstruction can match relative
+        # loudness (per-segment gain).  Descriptors fold into the render key
+        # so a prosody change re-renders the segment.
+        src_lang = context.get("source_language")
+        prosody_by_index: Dict[int, Any] = {}
+        spk_rates: Dict[str, List[float]] = {}
+        spk_energy: Dict[str, List[float]] = {}
+        for i, seg in enumerate(segments):
+            if seg.get("is_non_speech"):
+                continue
+            d = analyze_segment(
+                full_audio, full_sr,
+                float(seg.get("start", 0.0)), float(seg.get("end", 0.0)),
+                source_text=seg.get("source_text") or seg.get("text"),
+                lang=src_lang,
+            )
+            prosody_by_index[i] = d
+            spk = seg.get("speaker", "")
+            if d.speaking_rate_syl_s:
+                spk_rates.setdefault(spk, []).append(d.speaking_rate_syl_s)
+            if d.energy_rms > 0:
+                spk_energy.setdefault(spk, []).append(d.energy_rms)
+
+        def _mean(vals: List[float]) -> Optional[float]:
+            return float(np.median(vals)) if vals else None
+
+        mean_rate = {s: _mean(v) for s, v in spk_rates.items()}
+        mean_energy = {s: _mean(v) for s, v in spk_energy.items()}
+        for i, seg in enumerate(segments):
+            d = prosody_by_index.get(i)
+            if d is None:
+                continue
+            spk = seg.get("speaker", "")
+            seg["prosody_speed"] = compute_speed(d.speaking_rate_syl_s, mean_rate.get(spk))
+            seg["prosody_signature"] = d.signature()
+            seg["_prosody_gain"] = compute_gain(d.energy_rms, mean_energy.get(spk) or 0.0)
 
         # --- Segment-level reuse (spec Phase 4) ----------------------------
         # A per-speaker voice hash (cheap: one hash per reference) plus the
@@ -411,6 +457,7 @@ class GenerateStage:
             sf.write(str(out_wav), audio, model_sr, subtype="PCM_16")
             gen_duration = float(audio.shape[0]) / model_sr
 
+            _pros = prosody_by_index.get(i)
             manifest.append({
                 "index": i,
                 "speaker": speaker,
@@ -426,6 +473,9 @@ class GenerateStage:
                 "sample_rate": model_sr,
                 "render_key": rkey,
                 "reused": False,
+                "prosody_speed": float(seg.get("prosody_speed", 1.0) or 1.0),
+                "prosody_gain": float(seg.get("_prosody_gain", 1.0) or 1.0),
+                "prosody": _pros.to_dict() if _pros is not None else {},
             })
             synth_count += 1
 
@@ -439,6 +489,23 @@ class GenerateStage:
         manifest_path = self.out_dir / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
 
+        # Prosody report (derived diagnostic; also surfaced on the Timeline).
+        prosody_report = {
+            "$schema_version": 1,
+            "segments": [
+                {
+                    "index": i,
+                    "speaker": segments[i].get("speaker"),
+                    "prosody_speed": float(segments[i].get("prosody_speed", 1.0) or 1.0),
+                    "prosody_gain": float(segments[i].get("_prosody_gain", 1.0) or 1.0),
+                    **prosody_by_index[i].to_dict(),
+                }
+                for i in sorted(prosody_by_index)
+            ],
+        }
+        prosody_path = self.out_dir / "prosody.json"
+        prosody_path.write_text(json.dumps(prosody_report, indent=2, ensure_ascii=False))
+
         try:
             del model
         except Exception:
@@ -448,5 +515,6 @@ class GenerateStage:
         return {
             "generated_dir": str(self.out_dir),
             "manifest_path": str(manifest_path),
+            "prosody_path": str(prosody_path),
             "ref_transcripts": ref_transcripts,
         }

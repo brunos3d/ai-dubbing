@@ -202,8 +202,9 @@ def build_from_workspace(root: Path) -> Timeline:
                 if isinstance(entry, dict) and "index" in entry:
                     render_by_index.setdefault(int(entry["index"]), {}).update(entry)
 
-    # Prosody descriptors (Phase 5), if present.
-    prosody_doc = _read_json(root / "prosody" / "prosody.json")
+    # Prosody descriptors (Phase 5) travel inside the generate manifest
+    # entries; the generated_segments/prosody.json report mirrors them.
+    prosody_doc = _read_json(root / "generated_segments" / "prosody.json")
     prosody_by_index: Dict[int, Dict[str, Any]] = {}
     if isinstance(prosody_doc, dict) and isinstance(prosody_doc.get("segments"), list):
         for entry in prosody_doc["segments"]:
