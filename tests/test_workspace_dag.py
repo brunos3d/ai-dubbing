@@ -436,3 +436,62 @@ def test_to_stage_caps_stale_set(tmp_path: Path) -> None:
         CliOverrides(force=True, to_stage="transcribe"),
     )
     assert stale == ["extract", "separate", "diarize", "samples", "transcribe"]
+
+
+def test_untracked_config_fields_do_not_cause_false_stale(tmp_path: Path) -> None:
+    """Regression: the ``separate`` stage declares ``config_fields =
+    ["model", "device", "out_dir_name"]`` but ``WorkspacePipeline`` does
+    not carry those attributes (it only tracks the high-level knobs the
+    CLI exposes).  When ``generate()`` builds ``current_configs`` via
+    ``getattr(self, k, None)`` the untracked fields come back as
+    ``None``.  The old behaviour treated ``None != "cuda"`` as a config
+    change, which re-ran an already-finished Demucs separation for
+    nothing.  The DAG must ignore ``None``-valued current entries —
+    they are not user overrides, just gaps in the pipeline's tracking.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    _write_files(workspace)
+    m = _make_full_manifest(workspace)
+
+    # Simulate what ``WorkspacePipeline.generate()`` actually produces for
+    # the ``separate`` stage: the untracked fields come back as ``None``
+    # because the pipeline does not have those attributes.  Tracked
+    # fields (e.g. ``target_lufs`` for ``mix``) come back with the
+    # pipeline's default.
+    current_configs = {
+        "separate": {
+            "model": None,
+            "device": None,
+            "out_dir_name": None,
+        },
+    }
+    stale = compute_stale_set(m, workspace, current_configs=current_configs)
+    assert stale == [], (
+        f"Untracked (None) config fields must not mark stages stale. "
+        f"Got stale={stale!r}"
+    )
+
+
+def test_real_config_change_is_still_detected(tmp_path: Path) -> None:
+    """Companion to ``test_untracked_config_fields_do_not_cause_false_stale``:
+    a genuinely different user-supplied value must still invalidate the
+    stage.  The previous fix must not over-correct.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    _write_files(workspace)
+    m = _make_full_manifest(workspace)
+
+    current_configs = {
+        "separate": {
+            "model": "htdemucs_ft",  # user explicitly asked for a different model
+            "device": None,            # untracked, ignored
+            "out_dir_name": None,      # untracked, ignored
+        },
+    }
+    stale = compute_stale_set(m, workspace, current_configs=current_configs)
+    assert "separate" in stale, (
+        f"An explicit config override must still mark the stage stale. "
+        f"Got stale={stale!r}"
+    )

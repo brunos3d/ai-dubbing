@@ -113,32 +113,39 @@ def _collect_speaker_chunks(
     return out
 
 
-def _transcribe_reference(audio_path: Path, source_language: Optional[str]) -> str:
+def _transcribe_reference(
+    audio_path: Path, 
+    source_language: Optional[str],
+    model: Optional[Any] = None,
+) -> str:
     """Run faster-whisper (tiny) on a short reference clip."""
+    local_model = False
     try:
         from faster_whisper import WhisperModel
 
-        LOG.info(f"Transcribing reference {audio_path.name} with faster-whisper (tiny)")
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        try:
-            lang = source_language if source_language and source_language != "auto" else None
-            segs, _info = model.transcribe(
-                str(audio_path),
-                language=lang,
-                beam_size=1,
-                vad_filter=True,
-            )
-            text = " ".join(s.text.strip() for s in segs).strip()
-        finally:
+        if model is None:
+            LOG.info(f"Transcribing reference {audio_path.name} with faster-whisper (tiny)")
+            model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            local_model = True
+        
+        lang = source_language if source_language and source_language != "auto" else None
+        segs, _info = model.transcribe(
+            str(audio_path),
+            language=lang,
+            beam_size=1,
+            vad_filter=True,
+        )
+        return " ".join(s.text.strip() for s in segs).strip()
+    except Exception as exc:  # noqa: BLE001
+        LOG.warning(f"Whisper transcription of {audio_path} failed: {exc}")
+        return ""
+    finally:
+        if local_model:
             try:
                 del model
             except Exception:
                 pass
             free_vram()
-        return text
-    except Exception as exc:  # noqa: BLE001
-        LOG.warning(f"Whisper transcription of {audio_path} failed: {exc}")
-        return ""
 
 
 def build_speaker_profiles(
@@ -168,96 +175,112 @@ def build_speaker_profiles(
         
     speakers = sorted({s["speaker"] for s in diarized_segments})
 
+    # Pre-load tiny model once for all speaker references
+    from faster_whisper import WhisperModel
+    try:
+        whisper_tiny = WhisperModel("tiny", device="cpu", compute_type="int8")
+    except Exception as exc:
+        LOG.warning(f"Could not load whisper tiny for reference transcription: {exc}")
+        whisper_tiny = None
+
     out: Dict[str, Dict[str, Any]] = {}
-    for spk in speakers:
-        spk_dir = profiles_dir / spk
-        spk_dir.mkdir(parents=True, exist_ok=True)
-        
-        all_chunks = _collect_speaker_chunks(mono, sr, diarized_segments, spk)
-        if not all_chunks:
-            LOG.warning(f"  {spk}: no valid speech chunks found")
-            continue
+    try:
+        for spk in speakers:
+            spk_dir = profiles_dir / spk
+            spk_dir.mkdir(parents=True, exist_ok=True)
+            
+            all_chunks = _collect_speaker_chunks(mono, sr, diarized_segments, spk)
+            if not all_chunks:
+                LOG.warning(f"  {spk}: no valid speech chunks found")
+                continue
 
-        # We want to pick the SINGLE BEST profile for stability.
-        # We'll call it 'primary'.
-        spk_profiles = {}
-        
-        # Display candidate scores for diagnostics
-        LOG.info(f"  {spk} reference candidates:")
-        for i, c in enumerate(all_chunks[:5]):
-            LOG.info(f"    #{i+1}: score={c.score:.1f} dur={c.duration_s:.1f}s snr={c.snr:.1f}")
+            # We want to pick the SINGLE BEST profile for stability.
+            # We'll call it 'primary'.
+            spk_profiles = {}
+            
+            # Display candidate scores for diagnostics
+            LOG.info(f"  {spk} reference candidates:")
+            for i, c in enumerate(all_chunks[:5]):
+                LOG.info(f"    #{i+1}: score={c.score:.1f} dur={c.duration_s:.1f}s snr={c.snr:.1f}")
 
-        # Best chunk
-        ch = all_chunks[0]
-        profile_name = "primary"
-        prof_dir = spk_dir / profile_name
-        prof_dir.mkdir(parents=True, exist_ok=True)
+            # Best chunk
+            ch = all_chunks[0]
+            profile_name = "primary"
+            prof_dir = spk_dir / profile_name
+            prof_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build the reference. If the best chunk is short, try to
-        # append other high-scoring chunks to reach target_seconds.
-        ref_chunks = [ch]
-        curr_dur = ch.duration_s
-        
-        if curr_dur < target_seconds:
-            for other in all_chunks:
-                if other in ref_chunks: continue
-                if curr_dur + other.duration_s > max_seconds: continue
-                ref_chunks.append(other)
-                curr_dur += other.duration_s
-                if curr_dur >= target_seconds:
-                    break
+            # Build the reference. If the best chunk is short, try to
+            # append other high-scoring chunks to reach target_seconds.
+            ref_chunks = [ch]
+            curr_dur = ch.duration_s
+            
+            if curr_dur < target_seconds:
+                for other in all_chunks:
+                    if other in ref_chunks: continue
+                    if curr_dur + other.duration_s > max_seconds: continue
+                    ref_chunks.append(other)
+                    curr_dur += other.duration_s
+                    if curr_dur >= target_seconds:
+                        break
 
-        # Concatenate with small gaps
-        gap = int(0.06 * sr)
-        ref_parts = []
-        for j, rch in enumerate(ref_chunks):
-            clip = mono[rch.start_sample:rch.end_sample]
-            if j > 0:
-                ref_parts.append(np.zeros(gap, dtype="float32"))
-            ref_parts.append(clip)
-        
-        ref_audio = np.concatenate(ref_parts)
-        ref_audio = rms_normalize(ref_audio, target_dbfs=-20.0)
-        ref_path = prof_dir / "reference.wav"
-        write_wav(ref_path, ref_audio, sr)
+            # Concatenate with small gaps
+            gap = int(0.06 * sr)
+            ref_parts = []
+            for j, rch in enumerate(ref_chunks):
+                clip = mono[rch.start_sample:rch.end_sample]
+                if j > 0:
+                    ref_parts.append(np.zeros(gap, dtype="float32"))
+                ref_parts.append(clip)
+            
+            ref_audio = np.concatenate(ref_parts)
+            ref_audio = rms_normalize(ref_audio, target_dbfs=-20.0)
+            ref_path = prof_dir / "reference.wav"
+            write_wav(ref_path, ref_audio, sr)
 
-        transcript = _transcribe_reference(ref_path, source_language)
-        transcript_path = prof_dir / "transcript.txt"
-        transcript_path.write_text(transcript + "\n", encoding="utf-8")
-        word_count = len(transcript.split())
+            transcript = _transcribe_reference(ref_path, source_language, model=whisper_tiny)
+            transcript_path = prof_dir / "transcript.txt"
+            transcript_path.write_text(transcript + "\n", encoding="utf-8")
+            word_count = len(transcript.split())
 
-        duration_s = ref_audio.shape[0] / sr
-        metadata = {
-            "speaker_id": spk,
-            "profile_id": profile_name,
-            "score": round(ch.score, 2),
-            "reference_duration": round(duration_s, 3),
-            "segments_used": len(ref_chunks),
-            "transcript_words": word_count,
-            "reference_path": str(ref_path),
-            "transcript_path": str(transcript_path),
-        }
-        meta_path = prof_dir / "metadata.json"
-        meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
+            duration_s = ref_audio.shape[0] / sr
+            metadata = {
+                "speaker_id": spk,
+                "profile_id": profile_name,
+                "score": round(ch.score, 2),
+                "reference_duration": round(duration_s, 3),
+                "segments_used": len(ref_chunks),
+                "transcript_words": word_count,
+                "reference_path": str(ref_path),
+                "transcript_path": str(transcript_path),
+            }
+            meta_path = prof_dir / "metadata.json"
+            meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False))
 
-        spk_profiles[profile_name] = {
-            "reference": str(ref_path),
-            "transcript": str(transcript_path),
-            "metadata": str(meta_path),
-            "duration_s": duration_s,
-            "word_count": word_count,
-            "transcript_text": transcript,
-            "score": ch.score,
-        }
+            spk_profiles[profile_name] = {
+                "reference": str(ref_path),
+                "transcript": str(transcript_path),
+                "metadata": str(meta_path),
+                "duration_s": duration_s,
+                "word_count": word_count,
+                "transcript_text": transcript,
+                "score": ch.score,
+            }
 
-        # Flat alias for backwards compatibility
-        if flat_dir is not None:
-            flat = flat_dir / f"{spk}.wav"
-            shutil.copy2(ref_path, flat)
+            # Flat alias for backwards compatibility
+            if flat_dir is not None:
+                flat = flat_dir / f"{spk}.wav"
+                shutil.copy2(ref_path, flat)
 
-        if spk_profiles:
-            out[spk] = {"profiles": spk_profiles}
-            LOG.info(f"  {spk}: primary profile selected (score={ch.score:.1f})")
+            if spk_profiles:
+                out[spk] = {"profiles": spk_profiles}
+                LOG.info(f"  {spk}: primary profile selected (score={ch.score:.1f})")
+    finally:
+        if whisper_tiny:
+            try:
+                del whisper_tiny
+            except Exception:
+                pass
+            free_vram()
 
     return out
 

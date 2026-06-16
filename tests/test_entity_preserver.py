@@ -195,6 +195,82 @@ def test_bad_glossary_does_not_crash():
         Path(f.name).unlink()
 
 
+def test_entities_format_preserve_action():
+    """The ``entities`` glossary format (``[{"original": ..., "replacement": ..., "action": ...}]``)
+    used by the Suits pilot glossary must be supported.
+
+    With ``action: preserve``, the ``original`` term survives translation
+    (current behaviour for the ``{term: {action: preserve}}`` form).
+    """
+    glossary_path = _write_glossary({
+        "entities": [
+            {"original": "Harvey", "replacement": "Harvey", "action": "preserve"},
+            {"original": "Mike", "replacement": "Mike", "action": "preserve"},
+        ]
+    })
+    try:
+        preserver = EntityPreserver(glossary_path=glossary_path)
+        assert preserver.is_active, "Entities-format glossary with 2 entries must be active"
+        assert preserver._loaded_count == 2
+
+        source = "Harvey and Mike walked into the office."
+        protected = preserver.protect(source)
+        # The literal names must be replaced with placeholders, not survive
+        # unprotected into the translator.
+        assert "Harvey" not in protected, (
+            f"'Harvey' must be protected in the entities-format glossary.\n"
+            f"  protected: {protected!r}"
+        )
+        assert "Mike" not in protected, (
+            f"'Mike' must be protected in the entities-format glossary.\n"
+            f"  protected: {protected!r}"
+        )
+        # Round-trip restores both names verbatim.
+        translated = "__ENT_0__ e __ENT_1__ entraram no escritório."
+        final = preserver.restore(translated)
+        assert final == "Harvey e Mike entraram no escritório.", (
+            f"Restored names must be the originals, not the translations.\n"
+            f"  got: {final!r}"
+        )
+    finally:
+        glossary_path.unlink()
+
+
+def test_entities_format_replace_action():
+    """The ``entities`` glossary format with ``action: replace`` must swap the
+    protected term for the ``replacement`` after translation, so the
+    legal-domain glossary can map English terms to their Brazilian
+    Portuguese counterparts (e.g. "Senior Partner" → "Sócio Sênior").
+    """
+    glossary_path = _write_glossary({
+        "entities": [
+            {"original": "Senior Partner", "replacement": "Sócio Sênior", "action": "replace"},
+        ]
+    })
+    try:
+        preserver = EntityPreserver(glossary_path=glossary_path)
+        assert preserver.is_active
+        assert preserver._loaded_count == 1
+
+        source = "Harvey is a Senior Partner at the firm."
+        protected = preserver.protect(source)
+        assert "Senior Partner" not in protected, (
+            f"'Senior Partner' must be protected.\n"
+            f"  protected: {protected!r}"
+        )
+
+        # The translator sees the placeholder and renders it back untouched.
+        translated = "Harvey é um __ENT_0__ na firma."
+        final = preserver.restore(translated)
+        assert final == "Harvey é um Sócio Sênior na firma.", (
+            f"With action=replace, the placeholder must be restored as the "
+            f"REPLACEMENT term, not the original.\n"
+            f"  got: {final!r}"
+        )
+    finally:
+        glossary_path.unlink()
+
+
 def run_all() -> int:
     """Discover and run every test_* function in this file."""
     tests = [
@@ -205,6 +281,8 @@ def run_all() -> int:
         test_glossary_with_multiple_terms_longest_first,
         test_is_active_reflects_glossary_presence,
         test_bad_glossary_does_not_crash,
+        test_entities_format_preserve_action,
+        test_entities_format_replace_action,
     ]
     failures = 0
     for t in tests:

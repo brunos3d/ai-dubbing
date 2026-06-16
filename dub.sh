@@ -131,7 +131,16 @@ if [[ "${1:-}" == "prepare" ]]; then
     if [[ ! -x "$PYTHON_BIN" ]]; then
         PYTHON_BIN="$(command -v python3)"
     fi
-    "$PYTHON_BIN" main.py prepare "${@:2}"
+    # If the first three args are not flags, assume they are <input> <src> <tgt>
+    if [[ $# -ge 4 && "${2:-}" != -* && "${3:-}" != -* && "${4:-}" != -* ]]; then
+        INPUT="$2"
+        SRC="$3"
+        TGT="$4"
+        shift 4
+        "$PYTHON_BIN" main.py prepare --input "$INPUT" --source-language "$SRC" --target-language "$TGT" "$@"
+    else
+        "$PYTHON_BIN" main.py prepare "${@:2}"
+    fi
     exit 0
 fi
 

@@ -524,7 +524,6 @@ def _maybe_merge_similar(
         new = dict(seg)
         if new["speaker"] in merge_map:
             new["speaker"] = merge_map[new["speaker"]]
-        new.pop("confidence", None)
         out.append(new)
     return out
 
@@ -575,6 +574,12 @@ def _extract_chunk_embeddings(
     # Build chunk mid-points and the provisional speaker label
     # for each one (the pyannote label of the segment that contains it).
     chunk_records: List[Tuple[float, float, int]] = []
+    
+    # Pre-fetch all tracks to avoid repeated calls
+    turns = list(pyannote_annotation.itertracks(yield_label=True))
+    turn_idx = 0
+    num_turns = len(turns)
+
     for t in np.arange(0.0, len(mono) / sr - window_s + 1e-9, hop_s):
         s0 = int(t * sr)
         s1 = int((t + window_s) * sr)
@@ -584,13 +589,21 @@ def _extract_chunk_embeddings(
         if np.sqrt(np.mean(chunk ** 2)) < silence_rms:
             continue
         mid = t + window_s / 2.0
+        
         # Find the provisional speaker (label of the segment containing mid)
+        # Optimized O(N+M) traversal
         spk_label = -1
-        for turn, _, speaker in pyannote_annotation.itertracks(yield_label=True):
+        
+        # Advance turn_idx to skip turns that end before mid
+        while turn_idx < num_turns and turns[turn_idx][0].end < mid:
+            turn_idx += 1
+            
+        # Check if the current turn contains mid
+        if turn_idx < num_turns:
+            turn, _, speaker = turns[turn_idx]
             if turn.start <= mid <= turn.end:
-                # Map the string label to a stable int
                 spk_label = speaker
-                break
+        
         chunk_records.append((t, t + window_s, spk_label))
 
     if not chunk_records:
@@ -949,6 +962,7 @@ class DiarizeStage:
 
         # ---- Pyannote path ----
         try:
+            log_vram(LOG)
             pipeline = _make_pipeline(self.model_id, self.hf_token)
             if pipeline is None:
                 raise RuntimeError(
@@ -973,7 +987,11 @@ class DiarizeStage:
                 kwargs["min_speakers"] = self.min_speakers
             if self.max_speakers is not None:
                 kwargs["max_speakers"] = self.max_speakers
+            
+            LOG.info("Running pyannote diarization...")
             out_obj = pipeline(audio_in, **kwargs)
+            log_vram(LOG)
+            
             initial_ann = (
                 out_obj.exclusive_speaker_diarization
                 if hasattr(out_obj, "exclusive_speaker_diarization")
@@ -982,9 +1000,6 @@ class DiarizeStage:
             n_pyannote = len(set(initial_ann.labels()))
             LOG.info(f"Pyannote provisional speakers: {n_pyannote}")
             initial_segments = _annotation_to_segments(out_obj)
-            # Drop the diagnostic 'confidence' key if any
-            for s in initial_segments:
-                s.pop("confidence", None)
             try:
                 del pipeline
             except Exception:
@@ -993,6 +1008,7 @@ class DiarizeStage:
 
             # ---- Re-clustering with per-chunk embeddings ----
             LOG.info("Re-clustering speaker embeddings to refine speaker count...")
+            log_vram(LOG)
             emb_model = _get_pyannote_embedding_model(
                 self.model_id, self.hf_token, self.device
             )
@@ -1000,6 +1016,7 @@ class DiarizeStage:
                 mono, sr, emb_model, initial_ann,
                 device=torch.device(self.device),
             )
+            log_vram(LOG)
             n_chunks = embeddings.shape[0]
             n_retained = n_chunks
             if n_chunks < 4:
@@ -1057,9 +1074,6 @@ class DiarizeStage:
                     chunk_centroids,
                 )
 
-            # Drop diagnostic-only keys before persisting
-            for s in final_segments:
-                s.pop("confidence", None)
             n_final = len({s["speaker"] for s in final_segments})
             LOG.info(f"Final speakers (after merge): {n_final}")
             LOG.info(f"Detected speakers: {n_final}")
