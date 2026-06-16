@@ -50,6 +50,12 @@ torch-cuda = [
 [project.scripts]
 ai-dubbing = "src.cli:main"
 
+[tool.pytest.ini_options]
+# Scope test discovery to the project's own suite so the vendored model
+# checkouts under models/ (e.g. silero-vad's own tests) are never collected.
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -118,6 +118,43 @@ def test_validate_diarization_segments_ok() -> None:
 
 
 # ---------------------------------------------------------------------------
+# bare-list (legacy / runtime) shapes — the stages actually emit these
+# ---------------------------------------------------------------------------
+
+
+def test_validate_transcript_accepts_bare_list() -> None:
+    """The transcribe stage emits a bare list of segments (no wrapper dict)."""
+    data = [
+        {"start": 0.0, "end": 1.5, "speaker": "speaker_01", "text": "Olá"},
+        {"start": 1.5, "end": 3.0, "speaker": "speaker_01", "text": "mundo"},
+    ]
+    assert validate_transcript(data) == []
+
+
+def test_validate_transcript_bare_list_flags_missing_field() -> None:
+    data = [{"start": 0.0, "end": 1.5, "speaker": "speaker_01"}]  # no text
+    issues = validate_transcript(data)
+    assert any(i.severity == "error" and "text" in i.path for i in issues), issues
+
+
+def test_validate_translation_bare_list_warns_missing_source_text() -> None:
+    data = [{"start": 0.0, "end": 1.5, "speaker": "speaker_01", "text": "hi"}]
+    issues = validate_translation(data)
+    assert any(
+        i.severity == "warning" and "source_text" in i.path for i in issues
+    ), issues
+
+
+def test_validate_diarization_accepts_bare_list() -> None:
+    """The diarize stage emits a bare list of {speaker,start,end} dicts."""
+    data = [
+        {"speaker": "speaker_01", "start": 0.0, "end": 1.5},
+        {"speaker": "speaker_02", "start": 1.5, "end": 3.0},
+    ]
+    assert validate_diarization_segments(data) == []
+
+
+# ---------------------------------------------------------------------------
 # speaker metadata
 # ---------------------------------------------------------------------------
 

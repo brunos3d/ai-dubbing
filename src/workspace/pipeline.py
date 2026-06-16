@@ -177,6 +177,99 @@ def _find_source_media(root: Path) -> Optional[Path]:
     return files[0] if files else None
 
 
+def _rewrite_staging_paths(obj, staging_str: str, workspace_str: str):
+    """Recursively replace any string in ``obj`` that starts with
+    ``staging_str`` so it starts with ``workspace_str`` instead.
+
+    The orchestrator redirects each stage's writes to a staging dir
+    under ``<root>/.tmp/<stage>-<uuid8>/`` and only promotes to the
+    real workspace root on success.  Stage return values often embed
+    absolute paths inside that staging dir (e.g.
+    ``speaker_profiles[spk].profiles.primary.reference`` points to
+    ``<staging>/speaker_profiles/.../reference.wav``).  After
+    :func:`promote` the staging dir is gone, so downstream stages
+    would dereference a stale path.  This helper walks the return
+    value and rewrites every string that names a file or directory
+    inside the staging dir to point at its post-promote location.
+    """
+    if isinstance(obj, str):
+        if obj.startswith(staging_str):
+            return workspace_str + obj[len(staging_str):]
+        return obj
+    if isinstance(obj, dict):
+        return {k: _rewrite_staging_paths(v, staging_str, workspace_str) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_rewrite_staging_paths(v, staging_str, workspace_str) for v in obj)
+    return obj
+
+
+def load_speaker_profiles_from_disk(workspace_root: Path) -> Dict[str, Any]:
+    """Rebuild the ``speaker_profiles`` context dict from the on-disk
+    ``speaker_profiles/`` directory.
+
+    The samples stage writes one sub-directory per speaker under
+    ``<workspace>/speaker_profiles/{spk}/{profile}/`` containing
+    ``metadata.json``, ``reference.wav`` and ``transcript.txt``.  The
+    OmniVoice generate stage consumes this dict from
+    ``context["speaker_profiles"]`` to drive voice cloning.  When
+    generate is reached on a resume (samples not re-run in the
+    current session), the context is empty unless we re-hydrate it
+    from the persisted tree.
+
+    ``metadata.json`` may record absolute paths from a previous run
+    (e.g. ``<root>/.tmp/samples-<uuid8>/speaker_profiles/...``) that
+    no longer exist because the staging dir was cleaned up after
+    :func:`promote`.  We therefore prefer the on-disk canonical path
+    ``<profiles_dir>/<spk>/<profile>/reference.wav`` whenever that
+    file exists, falling back to the metadata's recorded path only
+    when the canonical file is missing.
+
+    Mirrors the legacy ``Pipeline._build_context`` behaviour
+    (``src/pipeline.py`` lines 314-334) so the workspace pipeline
+    behaves identically.
+    """
+    profiles_dir = Path(workspace_root) / "speaker_profiles"
+    out: Dict[str, Any] = {}
+    if not profiles_dir.exists():
+        return out
+    for spk_path in profiles_dir.iterdir():
+        if not spk_path.is_dir():
+            continue
+        spk = spk_path.name
+        out[spk] = {"profiles": {}}
+        for prof_path in spk_path.iterdir():
+            if not prof_path.is_dir():
+                continue
+            meta_path = prof_path / "metadata.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            transcript_path = prof_path / "transcript.txt"
+            # Prefer the on-disk canonical reference path.  The
+            # metadata's recorded path may point at a cleaned-up
+            # staging dir from a previous run.
+            canonical_reference = prof_path / "reference.wav"
+            if canonical_reference.exists():
+                reference = str(canonical_reference)
+            else:
+                reference = meta.get(
+                    "reference_path", str(canonical_reference)
+                )
+            out[spk]["profiles"][prof_path.name] = {
+                "reference": reference,
+                "transcript_text": (
+                    transcript_path.read_text(encoding="utf-8").strip()
+                    if transcript_path.exists()
+                    else ""
+                ),
+                "score": meta.get("score", 0.0),
+            }
+    return out
+
+
 def _build_stage(
     name: str,
     workspace_root: Path,
@@ -381,6 +474,24 @@ class WorkspacePipeline:
         """Return the SHA-256 of the input media file."""
         return _media_hash(self.input_path)
 
+    def _current_configs(self) -> Dict[str, Dict[str, Any]]:
+        """Build the per-stage ``current_configs`` map for the invalidation DAG.
+
+        For every stage, collect the values of its declared ``config_fields``
+        from this pipeline instance (``None`` for fields the pipeline does not
+        carry — the DAG treats ``None`` as "not an override", see
+        :func:`src.workspace.dag._stage_has_config_change`).
+        """
+        configs: Dict[str, Dict[str, Any]] = {}
+        for name in STAGE_ORDER:
+            cls = STAGE_CLASSES.get(name)
+            if cls:
+                configs[name] = {
+                    k: getattr(self, k, None)
+                    for k in getattr(cls, "config_fields", [])
+                }
+        return configs
+
     def _id(self) -> Tuple[str, str, str]:
         """Compute ``(workspace_id, content_hash, pipeline_config_hash)``."""
         cfg_hash = pipeline_config_hash(self._config())
@@ -467,8 +578,17 @@ class WorkspacePipeline:
 
     # -- prepare / generate ----------------------------------------------
 
-    def prepare(self) -> Tuple[str, Path]:
-        """Run the ``extract .. translate`` stages; return ``(workspace_id, root)``."""
+    def prepare(self, *, force: bool = False) -> Tuple[str, Path]:
+        """Run the stale subset of ``extract .. translate``; return ``(workspace_id, root)``.
+
+        ``prepare`` is now staleness-aware (it used to re-run every analysis
+        stage unconditionally).  On a fresh workspace every prepare stage is
+        stale (its outputs do not exist yet) so all of them run; on a repeat
+        ``prepare`` of an unchanged input nothing is stale and the cached
+        artefacts are reused — this is what restores the resume/cache
+        behaviour the one-shot ``run`` path relies on, now that ``run`` is
+        routed through the workspace orchestrator.
+        """
         wid, content_h, cfg_hash = self._id()
         root = self._resolve_workspace_root(wid)
         root.mkdir(parents=True, exist_ok=True)
@@ -478,7 +598,18 @@ class WorkspacePipeline:
         self._write_metadata(root, content_h, cfg_hash)
 
         manifest = self._load_or_init_manifest(wid, root=root)
-        self._run_stages(manifest, prepare_stages(), start_at="extract", workspace_root=root)
+
+        overrides = CliOverrides(force=force)
+        stale = compute_stale_set(
+            manifest, root, overrides, current_configs=self._current_configs()
+        )
+        prepare_set = [s for s in prepare_stages() if s in stale]
+        if prepare_set:
+            self._run_stages(
+                manifest, prepare_set, start_at=prepare_set[0], workspace_root=root
+            )
+        else:
+            LOG.info("prepare: all analysis stages up to date for %s", wid)
         # Record the *initial* disk hashes for the not-yet-run generate
         # stages.  This must happen *before* the user has a chance to edit
         # any file, so the invalidation DAG in a later ``generate()`` has
@@ -545,14 +676,7 @@ class WorkspacePipeline:
             )
 
         # Build current_configs for invalidation DAG.
-        current_configs = {}
-        for name in STAGE_ORDER:
-            cls = STAGE_CLASSES.get(name)
-            if cls:
-                current_configs[name] = {
-                    k: getattr(self, k, None)
-                    for k in getattr(cls, "config_fields", [])
-                }
+        current_configs = self._current_configs()
 
         overrides = CliOverrides(force=force, from_stage=from_stage, to_stage=to_stage)
         stale = compute_stale_set(manifest, root, overrides, current_configs=current_configs)
@@ -561,6 +685,57 @@ class WorkspacePipeline:
             return workspace_id_str, root
         self._run_stages(manifest, stale, start_at=stale[0], workspace_root=root)
         return workspace_id_str, root
+
+    def run_oneshot(
+        self,
+        *,
+        output_dir: Optional[Path] = None,
+        skip_video: bool = False,
+        force: bool = False,
+        from_stage: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """One-shot ``prepare`` + ``generate`` for the legacy ``run`` UX.
+
+        This is the single orchestration entry point the CLI ``run`` command
+        (and the :class:`~src.pipeline.Pipeline` compatibility shim) call, so
+        there is exactly one code path through the workspace orchestrator.
+
+        Final artefacts are copied from ``<workspace>/output/`` into
+        ``output_dir`` (preserving the ``final_audio.wav`` / ``final_video.mp4``
+        contract that ``dub.sh`` reads from ``--output-dir``).
+        """
+        if force:
+            # ``--no-cache`` semantics: wipe the workspace so every stage
+            # rebuilds from scratch (mirrors the legacy Pipeline behaviour).
+            wid, _, _ = self._id()
+            root = self._resolve_workspace_root(wid)
+            if root.exists():
+                LOG.info("run_oneshot: force rebuild — clearing workspace %s", root)
+                shutil.rmtree(root, ignore_errors=True)
+
+        wid, root = self.prepare(force=force)
+        to_stage = "mix" if skip_video else None
+        self.generate(wid, from_stage=from_stage, to_stage=to_stage, force=force)
+
+        result: Dict[str, Any] = {
+            "workspace_id": wid,
+            "workspace_root": str(root),
+            "final_audio": str(root / "output" / "final_audio.wav"),
+            "final_video": str(root / "output" / "final_video.mp4"),
+        }
+
+        # Deliver final artefacts into the requested output dir.
+        if output_dir is not None:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("final_audio.wav", "final_video.mp4"):
+                src = root / "output" / name
+                if src.exists():
+                    dst = output_dir / name
+                    if src.resolve() != dst.resolve():
+                        shutil.copy2(src, dst)
+            result["output_dir"] = str(output_dir)
+        return result
 
     def _refresh_consumer_inputs(
         self, manifest: Manifest, producer_output_path: str, workspace_root: Path
@@ -573,8 +748,6 @@ class WorkspacePipeline:
         created.
         """
         for consumer_name, consumer_rec in manifest.stages.items():
-            if consumer_name == manifest.stages and False:
-                pass
             new_inputs = []
             changed = False
             for ref in consumer_rec.inputs:
@@ -719,12 +892,31 @@ class WorkspacePipeline:
             workspace_root / "translation" / "translated_transcript.json"
         )
         context["generated_dir"] = str(workspace_root / "generated_segments")
-        context["manifest_path"] = str(workspace_root / "generated_segments" / "manifest.json")
+        context["manifest_path"] = str(workspace_root / "aligned_manifest.json")
+        # ``generated_segments/manifest.json`` is the per-segment
+        # output of the generate stage; the align stage overwrites
+        # the context's ``manifest_path`` with the aligned manifest
+        # when it runs (see :meth:`_run_single_stage`).  But the
+        # reconstruct / mix / video stages need the aligned manifest
+        # *even on a cold resume where align did not re-run*, so we
+        # seed the context with the aligned-manifest path rather
+        # than the generated one.  The align stage's return value
+        # also points at the aligned manifest, so the seed and the
+        # post-align state agree.
         context["aligned_dir"] = str(workspace_root / "aligned_segments")
         context["aligned_manifest"] = str(workspace_root / "aligned_manifest.json")
         context["reconstructed_path"] = str(workspace_root / "output" / "reconstructed_speech.wav")
         context["final_path"] = str(workspace_root / "output" / "final_audio.wav")
         context["final_video"] = str(workspace_root / "output" / "final_video.mp4")
+
+        # Re-hydrate ``speaker_profiles`` from the persisted
+        # ``speaker_profiles/`` tree so the generate stage has access
+        # to voice profiles when reached on a resume where samples did
+        # not re-run.  This is the only way the OmniVoice generate
+        # stage can run outside of a single-session ``prepare()``
+        # invocation.  If samples re-runs in this session its return
+        # value will overwrite this dict (see ``_run_single_stage``).
+        context["speaker_profiles"] = load_speaker_profiles_from_disk(workspace_root)
 
         # ``stages[0]`` may not equal ``start_at`` when ``--to-stage`` trims
         # the bottom of the range. Skip everything before ``start_at``.
@@ -781,9 +973,9 @@ class WorkspacePipeline:
 
         try:
             if name == "extract":
-                stage.run(self.input_path, context._data)
+                result = stage.run(self.input_path, context._data)
             else:
-                stage.run(context._data)
+                result = stage.run(context._data)
         except Exception as exc:  # noqa: BLE001 - we record and re-raise
             shutil.rmtree(staging, ignore_errors=True)
             failed = StageRecord(
@@ -802,6 +994,48 @@ class WorkspacePipeline:
             manifest.save(workspace_root / "manifest.json")
             LOG.error("Stage %s failed: %s", name, exc)
             raise
+
+        # Rewrite any absolute paths in the return value that point into
+        # the staging dir so they point into the workspace root instead.
+        # The stage wrote its outputs to ``staging/...``; after promote
+        # those files live in ``workspace_root/...`` but the stage's
+        # return value (e.g. ``speaker_profiles[spk].reference``) still
+        # carries the staging-dir absolute paths.  Without rewriting,
+        # downstream stages would try to read from a directory that was
+        # just removed by :func:`promote`.
+        if isinstance(result, dict):
+            staging_str = str(staging)
+            workspace_str = str(workspace_root)
+            result = _rewrite_staging_paths(result, staging_str, workspace_str)
+
+        # Merge the stage's return value into the context so downstream
+        # stages can read the upstream artefacts (e.g. the samples stage
+        # returns ``{"speaker_profiles": ...}`` which the OmniVoice
+        # generate stage needs from ``context["speaker_profiles"]``).
+        # The legacy ``Pipeline.run`` does the same thing; the original
+        # workspace orchestrator discarded the return value, which made
+        # the generate stage raise ``"No speaker voice profiles
+        # available"`` on every real workspace run.
+        #
+        # Special case: if a stage returns ``manifest_path``, that
+        # always wins — the align stage, for example, returns the
+        # path to ``aligned_manifest.json`` and downstream stages
+        # (reconstruct, mix, video) need to read from there rather
+        # than the generated-segments manifest the orchestrator
+        # pre-populates.  Without this override, the reconstruct
+        # stage would fail with "Manifest entries lack aligned_path".
+        if isinstance(result, dict):
+            for k, v in result.items():
+                if k == "manifest_path" and v:
+                    context._data[k] = v
+                    continue
+                # Don't clobber other well-known context keys the
+                # orchestrator pre-populated from the workspace layout
+                # (audio_path, speech_path, etc.) with stale per-stage
+                # values.
+                if k in context._data and k in _CONTEXT_KEYS:
+                    continue
+                context._data[k] = v
 
         # On success, promote staging into the workspace root.
         promote(staging, workspace_root)
@@ -843,7 +1077,6 @@ class WorkspacePipeline:
         # start.
         for out_ref in outputs:
             self._refresh_consumer_inputs(manifest, out_ref.path, workspace_root)
-        manifest.save(workspace_root / "manifest.json")
         manifest.save(workspace_root / "manifest.json")
         LOG.info("[ok] %s done in %.2fs", name, time.time() - started)
 
