@@ -115,6 +115,12 @@ def reconstruct_timeline(
 
             seg_data = resample(seg_data, seg_sr, bg_sr)
             seg_sr = bg_sr
+        # Apply the prosody-derived per-segment gain (Phase 5) so the source's
+        # relative emphasis/de-emphasis across a turn is preserved instead of
+        # flattening every line to the same level.
+        gain = float(entry.get("prosody_gain", 1.0) or 1.0)
+        if abs(gain - 1.0) > 1e-3:
+            seg_data = seg_data * gain
         start = int(round(float(entry.get("start", 0.0)) * bg_sr))
         # NOTE: the align stage (src/stages/align.py) is the single
         # duration-correction authority.  Reconstruct only *places* the

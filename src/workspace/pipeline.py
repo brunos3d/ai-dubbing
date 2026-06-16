@@ -110,6 +110,7 @@ _DERIVED_PATHS: List[str] = [
     "diarization/embeddings.npz",
     "logs/pipeline.log",
     "translation/timing_report.json",
+    "generated_segments/prosody.json",
     "timeline.json",
 ]
 

@@ -106,9 +106,15 @@ EXPECTED: dict[type, dict] = {
     },
     GenerateStage: {
         "inputs": ["translation/translated_transcript.json"],
-        "outputs": ["generated_segments/manifest.json"],
+        "outputs": [
+            "generated_segments/manifest.json",
+            "generated_segments/prosody.json",
+        ],
         "editable_outputs": [],
-        "derived_outputs": ["generated_segments/manifest.json"],
+        "derived_outputs": [
+            "generated_segments/manifest.json",
+            "generated_segments/prosody.json",
+        ],
         "config_fields": ["model_id", "target_language", "use_clone_prompt"],
     },
     AlignStage: {
