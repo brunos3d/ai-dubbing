@@ -115,7 +115,10 @@ EXPECTED: dict[type, dict] = {
             "generated_segments/manifest.json",
             "generated_segments/prosody.json",
         ],
-        "config_fields": ["model_id", "target_language", "use_clone_prompt"],
+        "config_fields": [
+            "model_id", "target_language", "use_clone_prompt",
+            "max_speed", "max_fit_iters",
+        ],
     },
     AlignStage: {
         "inputs": ["generated_segments/manifest.json"],

@@ -102,6 +102,85 @@ def _transcribe_ref_with_whisper(
     return text
 
 
+def _next_speed(
+    measured: float,
+    slot: float,
+    cur_speed: float,
+    max_speed: float,
+    tol: float,
+) -> Optional[float]:
+    """Next speaking-speed to try, or None when no further pass helps.
+
+    Only *overruns* (speech longer than the slot, which bleed into the next
+    turn) are corrected, by scaling speed up proportionally and clamping to
+    ``max_speed`` for naturalness. Underruns are left as natural pauses.
+    """
+    if slot <= 0 or measured <= 0:
+        return None
+    if measured <= slot * (1.0 + tol):
+        return None  # fits, or underruns -> accept
+    target = min(cur_speed * (measured / slot), max_speed)
+    if target <= cur_speed + 1e-3:
+        return None  # already at the cap; cannot compress further
+    return round(target, 3)
+
+
+def generate_fitted(
+    model,
+    text: str,
+    language: str,
+    ref_audio: tuple,
+    ref_text: Optional[str],
+    slot_s: float,
+    base_speed: float = 1.0,
+    tol: float = 0.10,
+    max_speed: float = 1.35,
+    max_iters: int = 2,
+):
+    """Synthesize ``text`` so it fits ``slot_s``, iterating on speed.
+
+    Returns ``(audio, sample_rate, final_speed, duration_s, iterations)``.
+    Timing is treated as a generation constraint: we measure the real output
+    and raise OmniVoice's speed to compress overruns, rather than fixing them
+    after the fact with a lossy time-stretch. The best (least-overrun)
+    candidate is returned.
+    """
+    sr = int(getattr(model, "sampling_rate", _DEFAULT_SR))
+
+    def _synth(speed: float) -> np.ndarray:
+        audios = model.generate(
+            text=text, language=language, ref_audio=ref_audio,
+            ref_text=ref_text, speed=float(speed),
+        )
+        if not audios:
+            raise RuntimeError("OmniVoice returned no audio")
+        a = audios[0]
+        if isinstance(a, torch.Tensor):
+            a = a.detach().cpu().numpy()
+        return np.asarray(a, dtype=np.float32).reshape(-1)
+
+    speed = float(base_speed)
+    audio = _synth(speed)
+    dur = audio.shape[0] / sr
+    best = (audio, speed, dur)
+    iters = 1
+    for _ in range(max_iters):
+        ns = _next_speed(dur, slot_s, speed, max_speed, tol)
+        if ns is None:
+            break
+        speed = ns
+        audio = _synth(speed)
+        dur = audio.shape[0] / sr
+        iters += 1
+        # Track the candidate with the smallest overrun beyond the slot.
+        if max(0.0, dur - slot_s) < max(0.0, best[2] - slot_s):
+            best = (audio, speed, dur)
+    # If the loop ended on a worse candidate than one seen earlier, use best.
+    if max(0.0, dur - slot_s) > max(0.0, best[2] - slot_s):
+        audio, speed, dur = best
+    return audio, sr, speed, dur, iters
+
+
 def _generate_one(
     model,
     text: str,
@@ -142,7 +221,10 @@ class GenerateStage:
         "generated_segments/manifest.json",
         "generated_segments/prosody.json",
     ]
-    config_fields: List[str] = ["model_id", "target_language", "use_clone_prompt"]
+    config_fields: List[str] = [
+        "model_id", "target_language", "use_clone_prompt",
+        "max_speed", "max_fit_iters",
+    ]
 
     def __init__(
         self,
@@ -153,6 +235,8 @@ class GenerateStage:
         out_dir_name: str = "generated_segments",
         use_clone_prompt: bool = True,
         duration_tolerance: float = 0.10,
+        max_speed: float = 1.35,
+        max_fit_iters: int = 2,
         offload_dir: str = "/tmp/opencode/omnivoice_offload",
         subdir: str | None = None,
     ):
@@ -165,6 +249,9 @@ class GenerateStage:
         self.out_dir = self.workdir / out_dir_name
         self.use_clone_prompt = use_clone_prompt
         self.duration_tolerance = duration_tolerance
+        # Iterative duration-fitting bounds (Objective #3).
+        self.max_speed = max_speed
+        self.max_fit_iters = max_fit_iters
         self.offload_dir = offload_dir
         self.subdir = subdir
 
@@ -427,35 +514,49 @@ class GenerateStage:
             wav, sr = _coerce_ref_audio(ref_audio_path)
             # Honour a prosody-derived speed when present (Phase 5); default 1.0.
             speed = float(seg.get("prosody_speed", 1.0) or 1.0)
-            kwargs: Dict[str, Any] = {
-                "text": text,
-                "language": _lang_name(self.target_language),
-                "ref_audio": (wav, sr),
-                "ref_text": ref_transcript or None,
-                "duration": float(orig_duration),
-                "speed": speed,
-            }
 
+            # Timing as a generation constraint (Objective #3): synthesize,
+            # measure, and raise speed to compress overruns until the line fits
+            # its slot — instead of conditioning on the raw slot duration (which
+            # OmniVoice fills by slowing the voice then silence-trimming) and
+            # patching up afterwards with a lossy time-stretch.
             try:
-                audios = model.generate(**kwargs)
+                audio, _sr, fit_speed, gen_duration, fit_iters = generate_fitted(
+                    model,
+                    text=text,
+                    language=_lang_name(self.target_language),
+                    ref_audio=(wav, sr),
+                    ref_text=ref_transcript or None,
+                    slot_s=float(orig_duration),
+                    base_speed=speed,
+                    tol=self.duration_tolerance,
+                    max_speed=self.max_speed,
+                    max_iters=self.max_fit_iters,
+                )
             except Exception as exc:  # noqa: BLE001
-                LOG.warning(f"Segment {i + 1} failed with duration conditioning, falling back: {exc}")
+                LOG.warning(f"Segment {i + 1} fitted synthesis failed, falling back: {exc}")
                 audios = model.generate(
                     text=text,
                     language=_lang_name(self.target_language),
                     ref_audio=(wav, sr),
                     ref_text=ref_transcript or None,
                 )
+                if not audios:
+                    raise RuntimeError(f"OmniVoice produced no audio for segment {i + 1}")
+                audio = audios[0]
+                if isinstance(audio, torch.Tensor):
+                    audio = audio.detach().cpu().numpy()
+                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+                fit_speed, fit_iters = speed, 1
+                gen_duration = float(audio.shape[0]) / model_sr
 
-            if not audios:
-                raise RuntimeError(f"OmniVoice produced no audio for segment {i + 1}")
-
-            audio = audios[0]
-            if isinstance(audio, torch.Tensor):
-                audio = audio.detach().cpu().numpy()
-            audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+            if fit_iters > 1:
+                LOG.info(
+                    f"  fitted in {fit_iters} passes: speed={fit_speed:.2f} "
+                    f"dur={gen_duration:.2f}s slot={orig_duration:.2f}s"
+                )
+            speed = fit_speed
             sf.write(str(out_wav), audio, model_sr, subtype="PCM_16")
-            gen_duration = float(audio.shape[0]) / model_sr
 
             _pros = prosody_by_index.get(i)
             manifest.append({
