@@ -76,6 +76,93 @@ def build_mix_filter(
     return ";".join(parts)
 
 
+def _non_speech_envelope(
+    speech_segments: List[Dict[str, Any]],
+    n_samples: int,
+    sr: int,
+    fade_s: float = 0.15,
+) -> "Any":
+    """Gain envelope that is 1.0 between speech turns and 0.0 during them.
+
+    Cosine fades of ``fade_s`` at every speech boundary keep the original
+    audience bed from clicking in/out. Used to gate the ORIGINAL audio so
+    only non-speech reactions (laughter, applause, room tone) survive while
+    the original speaker's voice — which lives inside the turns — is removed.
+    """
+    import numpy as np
+
+    env = np.ones(n_samples, dtype="float32")
+    fade = max(1, int(fade_s * sr))
+    ramp = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, fade, dtype="float32")))
+    for seg in speech_segments:
+        s = int(max(0.0, float(seg.get("start", 0.0))) * sr)
+        e = int(max(0.0, float(seg.get("end", 0.0))) * sr)
+        s = min(s, n_samples)
+        e = min(e, n_samples)
+        if e <= s:
+            continue
+        env[s:e] = 0.0
+        # Fade the original DOWN as the turn starts and UP as it ends.
+        a0 = max(0, s - fade)
+        env[a0:s] = np.minimum(env[a0:s], ramp[-(s - a0):][::-1] if s - a0 < fade else ramp[::-1])
+        b1 = min(n_samples, e + fade)
+        env[e:b1] = np.minimum(env[e:b1], ramp[: b1 - e])
+    return np.clip(env, 0.0, 1.0)
+
+
+def build_ambience_bed(
+    original_path: Path,
+    background_path: Path,
+    speech_segments: List[Dict[str, Any]],
+    output_path: Path,
+    sr: int = 48000,
+    gap_gain: float = 0.9,
+) -> Path:
+    """Build an ambience bed that preserves audience reactions (Failure #2).
+
+    ``ambience = separated_background + gap_gain * original * non_speech_mask``
+
+    The separated background carries whatever ambience Demucs kept; the
+    gated original restores laughter/applause that Demucs swept into the
+    vocals stem, but only in the gaps between diarized speech so the
+    original English voice is never reintroduced.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    orig, o_sr = sf.read(str(original_path), dtype="float32", always_2d=False)
+    if getattr(orig, "ndim", 1) > 1:
+        orig = orig.mean(axis=1)
+    bg, b_sr = sf.read(str(background_path), dtype="float32", always_2d=False)
+    if getattr(bg, "ndim", 1) > 1:
+        bg = bg.mean(axis=1)
+
+    def _resample(x, src, dst):
+        if src == dst or x.size == 0:
+            return x
+        try:
+            import librosa
+            return librosa.resample(x.astype("float32"), orig_sr=src, target_sr=dst)
+        except Exception:
+            idx = np.linspace(0, len(x) - 1, int(round(len(x) * dst / src))).astype(int)
+            return x[idx]
+
+    orig = _resample(orig, o_sr, sr)
+    bg = _resample(bg, b_sr, sr)
+
+    n = max(orig.shape[0], bg.shape[0])
+    orig = np.pad(orig, (0, n - orig.shape[0]))
+    bg = np.pad(bg, (0, n - bg.shape[0]))
+
+    env = _non_speech_envelope(speech_segments, n, sr, fade_s=0.15)
+    ambience = bg + gap_gain * orig * env
+    peak = float(np.max(np.abs(ambience))) if ambience.size else 0.0
+    if peak > 0.99:
+        ambience = ambience * (0.99 / peak)
+    sf.write(str(output_path), ambience.astype("float32"), sr)
+    return output_path
+
+
 def estimate_reverb(path: Path) -> float:
     """Crude reverberance estimate in ``[0, 1]`` from a speech stem.
 
@@ -183,6 +270,7 @@ class MixStage:
     derived_outputs: List[str] = ["output/final_audio.wav"]
     config_fields: List[str] = [
         "target_lufs", "speech_db", "background_db", "ducking", "room_match",
+        "preserve_audience",
     ]
 
     def __init__(
@@ -192,6 +280,7 @@ class MixStage:
         target_lufs: float = -16.0,
         ducking: bool = True,
         room_match: bool = True,
+        preserve_audience: bool = True,
         subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
@@ -201,6 +290,9 @@ class MixStage:
         self.target_lufs = target_lufs
         self.ducking = ducking
         self.room_match = room_match
+        # Recover audience laughter/applause from the original audio in the
+        # gaps between diarized speech (Failure #2).
+        self.preserve_audience = preserve_audience
         self.subdir = subdir
 
     def output_paths(self) -> List[Path]:
@@ -218,6 +310,34 @@ class MixStage:
             background_path = self.workdir / "background.wav"
         if not background_path.exists():
             raise FileNotFoundError(background_path)
+
+        # Audience preservation: rebuild the background as an ambience bed that
+        # restores laughter/applause from the original audio in non-speech gaps
+        # (Demucs sweeps those vocal reactions into the speech stem, leaving the
+        # separated background dry). Best-effort: fall back to the plain stem.
+        if self.preserve_audience:
+            original_path = context.get("audio_path")
+            segments_path = context.get("segments_path")
+            try:
+                if (
+                    original_path and Path(original_path).exists()
+                    and segments_path and Path(segments_path).exists()
+                ):
+                    speech_segments = json.loads(Path(segments_path).read_text(encoding="utf-8"))
+                    ambience_path = self.output_dir / "ambience_bed.wav"
+                    ambience_path.parent.mkdir(parents=True, exist_ok=True)
+                    build_ambience_bed(
+                        Path(original_path), background_path, speech_segments, ambience_path,
+                    )
+                    LOG.info(
+                        f"Audience preservation: ambience bed -> {ambience_path} "
+                        f"({len(speech_segments)} speech turns gated out)"
+                    )
+                    background_path = ambience_path
+                else:
+                    LOG.info("Audience preservation skipped: original/segments unavailable")
+            except Exception as exc:  # noqa: BLE001 - never block the mix on this
+                LOG.warning(f"Audience preservation failed ({exc}); using plain background")
 
         # Room match: estimate reverberance from the ORIGINAL separated speech
         # stem (not the dry synthetic one) and apply a light, capped reverb so
