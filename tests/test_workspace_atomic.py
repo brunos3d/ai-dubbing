@@ -68,3 +68,43 @@ def test_promote_cleans_staging_on_failure(tmp_path: Path) -> None:
         promote(staging, tmp_path)
     # The .tmp staging dir must be cleaned up.
     assert not staging.exists()
+
+
+def test_promote_replaces_existing_subdir_without_nesting(tmp_path):
+    """Promoting a dir whose destination already exists must replace, not nest.
+
+    Regression: shutil.move() into an existing directory moved the source
+    *inside* it, producing speaker_03/speaker_03/... and leaving stale data.
+    """
+    from src.workspace.atomic import promote
+
+    root = tmp_path / "root"
+    (root / "speaker_profiles" / "speaker_03" / "primary").mkdir(parents=True)
+    (root / "speaker_profiles" / "speaker_03" / "primary" / "ref.wav").write_text("OLD")
+
+    staging = tmp_path / "staging"
+    (staging / "speaker_profiles" / "speaker_03" / "primary").mkdir(parents=True)
+    (staging / "speaker_profiles" / "speaker_03" / "primary" / "ref.wav").write_text("NEW")
+
+    promote(staging, root)
+
+    # No nested duplicate directory.
+    assert not (root / "speaker_profiles" / "speaker_03" / "speaker_03").exists()
+    # Destination holds the fresh content.
+    assert (root / "speaker_profiles" / "speaker_03" / "primary" / "ref.wav").read_text() == "NEW"
+    assert not staging.exists()
+
+
+def test_promote_replaces_existing_file(tmp_path):
+    from src.workspace.atomic import promote
+
+    root = tmp_path / "root"
+    (root / "media").mkdir(parents=True)
+    (root / "media" / "speech.wav").write_text("OLD")
+
+    staging = tmp_path / "staging"
+    (staging / "media").mkdir(parents=True)
+    (staging / "media" / "speech.wav").write_text("NEW")
+
+    promote(staging, root)
+    assert (root / "media" / "speech.wav").read_text() == "NEW"

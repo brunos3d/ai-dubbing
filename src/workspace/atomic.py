@@ -49,6 +49,17 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _remove_path(p: Path) -> None:
+    """Remove a file or directory if it exists (idempotent)."""
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p, ignore_errors=True)
+    elif p.exists() or p.is_symlink():
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def promote(staging: Path, root: Path) -> None:
     """Move everything in ``staging`` into ``root``; clean up on failure.
 
@@ -73,9 +84,15 @@ def promote(staging: Path, root: Path) -> None:
                 for child in entry.iterdir():
                     child_dest = dest / child.name
                     child_dest.parent.mkdir(parents=True, exist_ok=True)
+                    # Replace, don't nest: shutil.move() into an existing
+                    # directory moves the source *inside* it (producing
+                    # speaker_03/speaker_03/...). Stage output replaces the
+                    # prior output for that key, so clear the destination first.
+                    _remove_path(child_dest)
                     shutil.move(str(child), str(child_dest))
             else:
                 dest.parent.mkdir(parents=True, exist_ok=True)
+                _remove_path(dest)
                 shutil.move(str(entry), str(dest))
     except Exception as exc:  # noqa: BLE001 - we rewrap below
         shutil.rmtree(staging, ignore_errors=True)
