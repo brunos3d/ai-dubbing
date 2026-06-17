@@ -12,6 +12,70 @@ from ..utils.vram import free_vram, log_vram
 LOG = get_logger("ai-dubbing.transcribe")
 
 
+def clean_transcript_text(text: str) -> str:
+    """Repair common ASR surface artifacts (Failure #4).
+
+    Targets defect *classes* that are unambiguous from the text alone:
+
+    * tokens carrying the Unicode replacement char ``U+FFFD`` (a decode
+      failure mid-word, e.g. ``"Auf �ative"``) are dropped whole — the
+      token is corrupt and there is nothing to salvage;
+    * stutter runs of three or more identical consecutive words
+      (``"initially initially initially"``) collapse to a single word;
+    * stray control characters and runs of whitespace are normalised.
+
+    Conservative by design: legitimate doubling (``"had had"``) and normal
+    text pass through untouched, so this never invents or rewrites content.
+    """
+    if not text:
+        return text
+
+    # 1. Strip control chars (keep normal whitespace).
+    text = "".join(
+        ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 0x20
+    )
+
+    # 2. Drop tokens carrying a replacement char.  A decode failure mid-word
+    #    makes Whisper split the broken word around the char ("Auf �ative"),
+    #    so when the char sits at a token edge we also drop the glued fragment
+    #    on that side (it is the other half of the same corrupt word).
+    if "�" in text:
+        tokens = text.split(" ")
+        drop = [False] * len(tokens)
+        for i, t in enumerate(tokens):
+            if "�" not in t:
+                continue
+            drop[i] = True
+            if t.startswith("�") and i > 0:          # tail fragment -> head before it
+                drop[i - 1] = True
+            if t.endswith("�") and i + 1 < len(tokens):  # head fragment -> tail after it
+                drop[i + 1] = True
+        text = " ".join(t for i, t in enumerate(tokens) if not drop[i])
+
+    # 3. Collapse stutter runs (>= 3 identical consecutive words, case-insensitive).
+    text = " ".join(_collapse_stutters(text.split()))
+
+    # 4. Normalise whitespace.
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _collapse_stutters(words: List[str]) -> List[str]:
+    """Collapse runs of >= 3 identical consecutive words to one; keep <= 2."""
+    out: List[str] = []
+    i = 0
+    n = len(words)
+    while i < n:
+        j = i
+        while j + 1 < n and words[j + 1].lower() == words[i].lower():
+            j += 1
+        run = j - i + 1
+        keep = 1 if run >= 3 else run
+        out.extend(words[i : i + keep])
+        i = j + 1
+    return out
+
+
 def _reverify_low_confidence(
     speech_path: Path,
     segment: Dict[str, Any],
@@ -19,10 +83,17 @@ def _reverify_low_confidence(
     language: Optional[str],
     device: str,
     compute_type: str,
-    threshold: float = -0.8,
+    threshold: float = 0.55,
     model: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Re-transcribe a low-confidence segment with higher effort (larger beam)."""
+    """Re-transcribe a low-confidence segment with higher effort (larger beam).
+
+    ``avg_logprob`` on our segments is a mean *word probability* in [0, 1]
+    (see :func:`_finalize_segment`), not a log-prob, so the gate compares
+    against a probability threshold.  A segment at or above ``threshold`` is
+    confident enough and skipped; below it we re-run Whisper with a larger
+    beam and keep the result only if it is more probable.
+    """
     if segment.get("avg_logprob", 0.0) >= threshold:
         return segment
 
@@ -198,7 +269,7 @@ def _split_if_long(
 
 
 def _finalize_segment(words: List[Dict[str, Any]], speaker: str) -> Dict[str, Any]:
-    text = " ".join(w["word"] for w in words).strip()
+    text = clean_transcript_text(" ".join(w["word"] for w in words).strip())
     
     # Check if this is a non-speech vocal event
     # Patterns: [Laughter], (Sigh), [BREATH], etc.
@@ -227,6 +298,78 @@ def _assign_speaker(t_start: float, t_end: float, segments: List[Dict[str, Any]]
             best_overlap = overlap
             best_speaker = s["speaker"]
     return best_speaker
+
+
+def _assign_word_speaker(
+    w_start: float, w_end: float, segments: List[Dict[str, Any]]
+) -> str:
+    """Assign a single word to a diarization speaker.
+
+    A word is short, so we first try the diarization turn that *overlaps*
+    it (max overlap wins).  Words that fall in a silent gap between turns
+    get the *nearest* turn by midpoint distance instead of the sentinel
+    ``speaker_unknown`` - this avoids fragmenting an utterance every time
+    Whisper's word boundary lands a few milliseconds outside pyannote's.
+    """
+    if not segments:
+        return "speaker_unknown"
+    best_speaker = ""
+    best_overlap = 0.0
+    for s in segments:
+        overlap = max(0.0, min(w_end, s["end"]) - max(w_start, s["start"]))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_speaker = s["speaker"]
+    if best_speaker:
+        return best_speaker
+    # No overlap: snap to the nearest turn by distance from the word midpoint.
+    mid = 0.5 * (w_start + w_end)
+    nearest = min(
+        segments,
+        key=lambda s: 0.0
+        if s["start"] <= mid <= s["end"]
+        else min(abs(mid - s["start"]), abs(mid - s["end"])),
+    )
+    return nearest["speaker"]
+
+
+def _segment_words_by_speaker(
+    words: List[Dict[str, Any]],
+    diar_segments: List[Dict[str, Any]],
+    max_gap: float = 0.8,
+    target_duration: float = 10.0,
+    max_duration: float = 15.0,
+) -> List[Dict[str, Any]]:
+    """Tag every word with a speaker, then group into utterances.
+
+    Unlike the old per-Whisper-segment assignment, this splits the word
+    stream wherever the *word-level* speaker changes, so a Whisper block
+    that straddles a turn boundary becomes two correctly-attributed
+    utterances instead of one mis-attributed one (Failure #1).
+    """
+    tagged = sorted(words, key=lambda w: w["start"])
+    for w in tagged:
+        w["speaker"] = _assign_word_speaker(w["start"], w["end"], diar_segments)
+
+    out: List[Dict[str, Any]] = []
+    run: List[Dict[str, Any]] = []
+    cur: Optional[str] = None
+    for w in tagged:
+        if cur is None or w["speaker"] == cur:
+            run.append(w)
+            cur = w["speaker"]
+        else:
+            out.extend(
+                _group_words_into_segments(run, cur, max_gap, target_duration, max_duration)
+            )
+            run = [w]
+            cur = w["speaker"]
+    if run and cur is not None:
+        out.extend(
+            _group_words_into_segments(run, cur, max_gap, target_duration, max_duration)
+        )
+    out.sort(key=lambda s: s["start"])
+    return out
 
 
 def transcribe_audio(
@@ -365,12 +508,12 @@ class TranscribeStage:
                 raise
         word_path.write_text(json.dumps(word_segments, indent=2, ensure_ascii=False))
 
-        merged: List[Dict[str, Any]] = []
-        for spk in sorted({s["speaker"] for s in diar_segments}):
-            spk_words = [w for w in word_segments if w["speaker"] == spk]
-            words = [ww for seg in spk_words for ww in seg["words"]]
-            merged.extend(_group_words_into_segments(words, spk))
-        merged.sort(key=lambda s: s["start"])
+        # Word-level speaker attribution (Failure #1): assign a speaker to
+        # every word from diarization and split utterances at turn changes,
+        # rather than stamping one speaker onto a whole Whisper segment that
+        # may span a turn boundary.
+        all_words = [ww for seg in word_segments for ww in seg["words"]]
+        merged = _segment_words_by_speaker(all_words, diar_segments)
         seg_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False))
 
         # --- Second Pass / Refinement ---
