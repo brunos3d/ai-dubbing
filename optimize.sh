@@ -220,11 +220,32 @@ cmd_run() {
     local pypid=$!
 
     cleanup() {
+        # Remove trap immediately to prevent re-entry on multiple CTRL+C
+        trap - INT TERM
+        
         if kill -0 "$pypid" 2>/dev/null; then
             echo; echo "${YEL}Stopping… (run is resumable: re-run the same command)${RST}"
             kill -INT "$pypid" 2>/dev/null || true
-            wait "$pypid" 2>/dev/null || true
+            
+            # Wait up to 5 seconds for graceful shutdown
+            local waited=0
+            while kill -0 "$pypid" 2>/dev/null && [ $waited -lt 5 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            
+            # Force kill if still running
+            if kill -0 "$pypid" 2>/dev/null; then
+                echo "${YEL}Force stopping…${RST}"
+                kill -KILL "$pypid" 2>/dev/null || true
+                wait "$pypid" 2>/dev/null || true
+            fi
         fi
+        
+        # Clean up tail process if running
+        [ -n "${TAILPID:-}" ] && kill "$TAILPID" 2>/dev/null || true
+        
+        exit 0
     }
     trap cleanup INT TERM
 
