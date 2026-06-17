@@ -71,9 +71,11 @@ class Pipeline:
         no_pyannote: bool = False,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
+        tts_backend: str = "omnivoice",
         **_ignored: Any,
     ):
         env()
+        self.tts_backend = (tts_backend or "omnivoice").strip().lower()
         self.input_path = input_path
         self.source_language = source_language
         self.target_language = target_language
@@ -130,6 +132,7 @@ class Pipeline:
             no_pyannote=self.no_pyannote,
             min_speakers=self.min_speakers,
             max_speakers=self.max_speakers,
+            tts_backend=self.tts_backend,
             workspace_root=self.workdir,
         )
         # ``--from-stage`` (explicit rebuild-from) takes precedence over the

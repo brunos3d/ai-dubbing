@@ -287,6 +287,7 @@ def _build_stage(
     max_speakers: Optional[int],
     glossary_path: Optional[Path],
     target_lufs: float,
+    tts_backend: str = "omnivoice",
 ):
     """Instantiate the right stage class with the right constructor kwargs.
 
@@ -331,7 +332,12 @@ def _build_stage(
             subdir=subdir,
         )
     if name == "generate":
-        return GenerateStage(workspace_root, target_language=target_language, subdir=subdir)
+        return GenerateStage(
+            workspace_root,
+            target_language=target_language,
+            tts_backend=tts_backend,
+            subdir=subdir,
+        )
     if name == "align":
         return AlignStage(workspace_root, target_language=target_language, subdir=subdir)
     if name == "reconstruct":
@@ -443,6 +449,7 @@ class WorkspacePipeline:
         no_pyannote: bool = False,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
+        tts_backend: str = "omnivoice",
         workspace_root: Optional[Path] = None,
         output_dir: Optional[Path] = None,
     ) -> None:
@@ -456,6 +463,10 @@ class WorkspacePipeline:
         self.no_pyannote = no_pyannote
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
+        # Selected TTS backend. Tracked per-stage (generate.config_fields), so
+        # it invalidates generate..video on change but does NOT participate in
+        # the workspace-identity hash (extract..translate stay valid).
+        self.tts_backend = (tts_backend or "omnivoice").strip().lower()
         self._workspace_root_override = workspace_root
         self._output_dir_override = output_dir
 
@@ -680,7 +691,14 @@ class WorkspacePipeline:
         
         # Hydrate settings from metadata before computing staleness.
         self._hydrate_from_metadata(root)
-        
+        # Persist the (possibly newly-selected) TTS backend into metadata.json.
+        # _write_metadata only rewrites when the backend actually changed.
+        try:
+            _, content_h, cfg_hash = self._id()
+            self._write_metadata(root, content_h, cfg_hash)
+        except Exception as exc:  # noqa: BLE001 - metadata refresh is best-effort
+            LOG.debug("metadata backend refresh skipped: %s", exc)
+
         manifest_path = root / "manifest.json"
         manifest = Manifest.load(manifest_path)
         if manifest is None:
@@ -834,14 +852,24 @@ class WorkspacePipeline:
             LOG.warning("Could not symlink source %s -> %s: %s", src, dest, exc)
 
     def _write_metadata(self, root: Path, content_h: str, cfg_hash: str) -> None:
-        """Write ``<root>/metadata.json`` per spec §8 (idempotent)."""
+        """Write ``<root>/metadata.json`` per spec §8 (idempotent).
+
+        Rewritten when the workspace is new *or* the selected TTS backend
+        changed, so metadata always reflects the current backend. The backend
+        lives in the ``config`` block but NOT in the identity hash, so changing
+        it keeps the same workspace while still being recorded.
+        """
         meta_path = root / "metadata.json"
         if meta_path.exists():
             try:
                 existing = json.loads(meta_path.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 existing = None
-            if existing and existing.get("workspace_id") == _read_workspace_id(root):
+            if (
+                existing
+                and existing.get("workspace_id") == _read_workspace_id(root)
+                and (existing.get("config") or {}).get("tts_backend") == self.tts_backend
+            ):
                 return
 
         wid = _read_workspace_id(root) or root.name
@@ -863,7 +891,9 @@ class WorkspacePipeline:
                 "source_language": self.source_language,
                 "target_language": self.target_language,
             },
-            "config": self._config(),
+            # Backend recorded in config for visibility; excluded from the
+            # identity hash (cfg_hash) so switching it keeps the workspace.
+            "config": {**self._config(), "tts_backend": self.tts_backend},
             "pipeline_config_hash": cfg_hash,
         }
         meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -975,6 +1005,7 @@ class WorkspacePipeline:
             max_speakers=self.max_speakers,
             glossary_path=self.glossary_path,
             target_lufs=self.target_lufs,
+            tts_backend=self.tts_backend,
         )
         # Redirect the stage's writes into the staging dir.
         subdir = stage_subdir(name)
@@ -1140,6 +1171,7 @@ class WorkspacePipeline:
             max_speakers=self.max_speakers,
             glossary_path=self.glossary_path,
             target_lufs=self.target_lufs,
+            tts_backend=self.tts_backend,
         )
         subdir = stage_subdir(name)
         stage.workdir = staging / subdir if subdir else staging

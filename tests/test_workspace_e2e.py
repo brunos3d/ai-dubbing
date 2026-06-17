@@ -132,7 +132,7 @@ STAGE_CONFIG: dict[str, List[str]] = {
     "samples": [],
     "transcribe": [],
     "translate": ["source_language", "target_language"],
-    "generate": [],
+    "generate": ["tts_backend"],
     "align": [],
     "reconstruct": [],
     "mix": [],
@@ -263,6 +263,7 @@ def install_stubs(monkeypatch, record):
         max_speakers,
         glossary_path,
         target_lufs,
+        tts_backend="omnivoice",
     ):
         cls = wsp_mod.STAGE_CLASSES[name]
         subdir = wsp_mod.stage_subdir(name)
@@ -281,6 +282,7 @@ def install_stubs(monkeypatch, record):
             max_speakers=max_speakers,
             glossary_path=glossary_path,
             target_lufs=target_lufs,
+            tts_backend=tts_backend,
             subdir=subdir,
         )
 
