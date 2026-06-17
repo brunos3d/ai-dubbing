@@ -65,6 +65,33 @@ def test_segment_splits_at_speaker_change():
     assert "useful things" in segs[1]["text"].lower()
 
 
+def test_spurious_short_flips_are_smoothed():
+    """Noisy 1-word speaker flips in crosstalk collapse into the real turn.
+
+    A long Colbert run with a single mis-diarized word in the middle must
+    not shatter into three segments; the stray word is absorbed.
+    """
+    diar = [
+        {"speaker": "speaker_01", "start": 0.0, "end": 5.0},
+        {"speaker": "speaker_03", "start": 2.1, "end": 2.4},  # stray blip
+    ]
+    words = [
+        _w("we", 0.2, 0.5),
+        _w("could", 0.5, 0.9),
+        _w("turn", 0.9, 1.3),
+        _w("Mars", 1.3, 1.8),
+        _w("into", 2.15, 2.35),  # lands on the blip -> speaker_03
+        _w("an", 3.0, 3.3),
+        _w("Earth", 3.3, 3.8),
+        _w("planet", 3.8, 4.5),
+    ]
+    segs = _segment_words_by_speaker(words, diar)
+    # The single stray word is absorbed; we get one coherent speaker_01 turn.
+    assert len(segs) == 1
+    assert segs[0]["speaker"] == "speaker_01"
+    assert "into" in segs[0]["text"]
+
+
 def test_pure_single_speaker_stays_single():
     words = [_w("Give", 150.0, 150.3), _w("me", 150.3, 150.5), _w("the", 150.5, 150.7)]
     diar = [{"speaker": "speaker_01", "start": 150.0, "end": 151.0}]

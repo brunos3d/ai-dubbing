@@ -333,6 +333,63 @@ def _assign_word_speaker(
     return nearest["speaker"]
 
 
+def _smooth_word_speakers(
+    words: List[Dict[str, Any]],
+    min_run_words: int = 3,
+    min_run_s: float = 0.7,
+) -> List[Dict[str, Any]]:
+    """Absorb spurious short speaker runs into their neighbours.
+
+    Word-level assignment exposes every wobble in the diarization boundary,
+    so rapid crosstalk shatters into 1-word flips.  A run that is both short
+    (< ``min_run_words`` words) and brief (< ``min_run_s`` seconds) is
+    merged into the temporally-closest neighbouring run.  Genuine short
+    turns that are slow/emphatic, and any run long enough to be a real
+    utterance, are preserved — so the true turn-straddle splits survive
+    while the noise collapses.
+    """
+    if not words:
+        return words
+
+    def _build_runs(ws: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        runs: List[List[Dict[str, Any]]] = [[ws[0]]]
+        for w in ws[1:]:
+            if w["speaker"] == runs[-1][0]["speaker"]:
+                runs[-1].append(w)
+            else:
+                runs.append([w])
+        return runs
+
+    runs = _build_runs(words)
+    changed = True
+    while changed and len(runs) > 1:
+        changed = False
+        for i, run in enumerate(runs):
+            dur = run[-1]["end"] - run[0]["start"]
+            if len(run) >= min_run_words or dur >= min_run_s:
+                continue
+            left = runs[i - 1] if i > 0 else None
+            right = runs[i + 1] if i + 1 < len(runs) else None
+            target = None
+            if left and right:
+                gap_l = run[0]["start"] - left[-1]["end"]
+                gap_r = right[0]["start"] - run[-1]["end"]
+                target = left if gap_l <= gap_r else right
+            elif left:
+                target = left
+            elif right:
+                target = right
+            if target is not None:
+                spk = target[0]["speaker"]
+                for w in run:
+                    w["speaker"] = spk
+                changed = True
+                break
+        if changed:
+            runs = _build_runs([w for r in runs for w in r])
+    return [w for r in runs for w in r]
+
+
 def _segment_words_by_speaker(
     words: List[Dict[str, Any]],
     diar_segments: List[Dict[str, Any]],
@@ -345,11 +402,14 @@ def _segment_words_by_speaker(
     Unlike the old per-Whisper-segment assignment, this splits the word
     stream wherever the *word-level* speaker changes, so a Whisper block
     that straddles a turn boundary becomes two correctly-attributed
-    utterances instead of one mis-attributed one (Failure #1).
+    utterances instead of one mis-attributed one (Failure #1).  A smoothing
+    pass first absorbs spurious 1-word flips from noisy diarization
+    boundaries so clean turns don't shatter during crosstalk.
     """
     tagged = sorted(words, key=lambda w: w["start"])
     for w in tagged:
         w["speaker"] = _assign_word_speaker(w["start"], w["end"], diar_segments)
+    tagged = _smooth_word_speakers(tagged)
 
     out: List[Dict[str, Any]] = []
     run: List[Dict[str, Any]] = []
