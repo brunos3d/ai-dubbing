@@ -125,6 +125,7 @@ EXPECTED: dict[type, dict] = {
         "config_fields": [
             "target_language",
             "tolerance",
+            "min_abs_correction_s",
             "regenerate_with_duration",
         ],
     },
