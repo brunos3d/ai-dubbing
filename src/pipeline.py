@@ -72,6 +72,10 @@ class Pipeline:
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
         tts_backend: str = "omnivoice",
+        stage_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+        optimization_source: Optional[str] = None,
+        optimization_iteration: Optional[int] = None,
+        optimization_score: Optional[float] = None,
         **_ignored: Any,
     ):
         env()
@@ -92,6 +96,10 @@ class Pipeline:
         self.no_pyannote = no_pyannote
         self.min_speakers = min_speakers
         self.max_speakers = max_speakers
+        self.stage_overrides = stage_overrides
+        self.optimization_source = optimization_source
+        self.optimization_iteration = optimization_iteration
+        self.optimization_score = optimization_score
 
     def pipeline_config_dict(self) -> dict:
         """Return the deterministic config dict used for workspace identity.
@@ -134,7 +142,12 @@ class Pipeline:
             max_speakers=self.max_speakers,
             tts_backend=self.tts_backend,
             workspace_root=self.workdir,
+            stage_overrides=self.stage_overrides,
         )
+        # Inject optimization metadata for tracking
+        wsp._optimization_source = self.optimization_source
+        wsp._optimization_iteration = self.optimization_iteration
+        wsp._optimization_score = self.optimization_score
         # ``--from-stage`` (explicit rebuild-from) takes precedence over the
         # ``--start-from`` resume hint; ``extract`` means "no override".
         from_stage = self.from_stage or (

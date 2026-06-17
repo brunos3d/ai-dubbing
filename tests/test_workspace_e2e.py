@@ -264,6 +264,7 @@ def install_stubs(monkeypatch, record):
         glossary_path,
         target_lufs,
         tts_backend="omnivoice",
+        stage_overrides=None,
     ):
         cls = wsp_mod.STAGE_CLASSES[name]
         subdir = wsp_mod.stage_subdir(name)

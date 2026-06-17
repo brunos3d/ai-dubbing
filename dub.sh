@@ -201,7 +201,7 @@ SKIP_NEXT=0
 VALUE_FLAGS=(
     --glossary --adapt-model --adapt-mode --whisper-model --target-lufs
     --hf-token --workdir --output-dir --start-from --only --from-stage
-    --emit -o
+    --emit -o --best --optimize-config
 )
 # Boolean flags forwarded to main.py without taking a value.
 BOOL_FLAGS=(--no-pyannote --no-cache --audio-only --no-video --read-only-cache)

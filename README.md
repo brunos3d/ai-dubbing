@@ -69,6 +69,28 @@ non-editable / derived artefact classes, common edit-then-resume workflows,
 and the `AI_DUBBING_WORKSPACES_ROOT` / `XDG_DATA_HOME` environment
 variables.
 
+## Self-optimization
+
+`optimize.sh` automatically searches for better pipeline parameters by
+repeatedly dubbing the same clip in a **same-language benchmark** (e.g.
+English → English) and scoring how closely the output matches the source:
+
+```bash
+./optimize.sh run    -m input/clip.mp4 -l en        # infinite, resumable (Ctrl-C to stop)
+./optimize.sh run    -m input/clip.mp4 -l en -n 50  # bounded
+./optimize.sh status -m input/clip.mp4 -l en        # progress / best so far
+./optimize.sh promote <path/to/best.json>           # update global pipeline defaults
+```
+
+You can also run a one-shot dubbing using a specific optimization artifact:
+
+```bash
+./dub.sh input.mp4 en pt --best path/to/best.json
+```
+
+See [docs/optimize.md](docs/optimize.md) for commands, flags, the composite
+metric, resuming, and storage details.
+
 ## Professional Dubbing Tips
 
 ### Named Entity Preservation
