@@ -275,8 +275,10 @@ def _transcribe_reference(
         from faster_whisper import WhisperModel
 
         if model is None:
-            LOG.info(f"Transcribing reference {audio_path.name} with faster-whisper (tiny)")
-            model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            from ..utils.asr import resolve_ref_asr
+            size, device, compute = resolve_ref_asr()
+            LOG.info(f"Transcribing reference {audio_path.name} with faster-whisper ({size} on {device})")
+            model = WhisperModel(size, device=device, compute_type=compute)
             local_model = True
         
         lang = source_language if source_language and source_language != "auto" else None
@@ -326,13 +328,21 @@ def build_speaker_profiles(
         
     speakers = sorted({s["speaker"] for s in diarized_segments})
 
-    # Pre-load tiny model once for all speaker references
+    # Pre-load the reference-ASR model once for all speaker references.
+    # Runs on GPU with a stronger model when available (Objective #5) so the
+    # clone prompt (ref_text) is faithful rather than tiny's best guess.
     from faster_whisper import WhisperModel
+    from ..utils.asr import resolve_ref_asr
+    _ref_size, _ref_dev, _ref_compute = resolve_ref_asr()
     try:
-        whisper_tiny = WhisperModel("tiny", device="cpu", compute_type="int8")
+        whisper_tiny = WhisperModel(_ref_size, device=_ref_dev, compute_type=_ref_compute)
+        LOG.info(f"Reference ASR: {_ref_size} on {_ref_dev} ({_ref_compute})")
     except Exception as exc:
-        LOG.warning(f"Could not load whisper tiny for reference transcription: {exc}")
-        whisper_tiny = None
+        LOG.warning(f"Could not load reference ASR ({_ref_size}/{_ref_dev}): {exc}; falling back to tiny/cpu")
+        try:
+            whisper_tiny = WhisperModel("tiny", device="cpu", compute_type="int8")
+        except Exception:
+            whisper_tiny = None
 
     out: Dict[str, Dict[str, Any]] = {}
     try:
