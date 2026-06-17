@@ -30,6 +30,143 @@ LOG = get_logger("ai-dubbing.samples")
 # Quality-based Profile Selection
 # ---------------------------------------------------------------------------
 
+def _frame_rms(audio: np.ndarray, sr: int, frame_ms: float = 25.0, hop_ms: float = 10.0):
+    """Return (rms_per_frame, hop_samples, frame_samples)."""
+    win = max(1, int(frame_ms / 1000.0 * sr))
+    hop = max(1, int(hop_ms / 1000.0 * sr))
+    if audio.shape[0] < win:
+        return np.array([np.sqrt(np.mean(audio ** 2))], dtype="float32"), hop, win
+    n = 1 + (audio.shape[0] - win) // hop
+    rms = np.empty(n, dtype="float32")
+    for i in range(n):
+        seg = audio[i * hop:i * hop + win]
+        rms[i] = np.sqrt(np.mean(seg ** 2))
+    return rms, hop, win
+
+
+def _voiced_frame_mask(audio: np.ndarray, sr: int, ratio: float = 0.15) -> np.ndarray:
+    """Boolean per-frame voiced mask via a peak-relative energy threshold.
+
+    The threshold is a fraction of a robust peak (95th-percentile frame RMS),
+    NOT of the signal's own low percentile — an adaptive noise-floor threshold
+    collapses to "nothing is voiced" once a reference is already dense, which
+    is exactly the dense, silence-trimmed signal we want to keep.
+    """
+    rms, _, _ = _frame_rms(audio, sr)
+    if rms.size == 0:
+        return np.zeros(0, dtype=bool)
+    peak = float(np.percentile(rms, 95))
+    if peak < 1e-6:
+        return np.zeros_like(rms, dtype=bool)
+    return rms > ratio * peak
+
+
+def _voiced_frac(audio: np.ndarray, sr: int) -> float:
+    """Fraction of frames that are voiced (speech-active)."""
+    mask = _voiced_frame_mask(audio, sr)
+    return float(mask.mean()) if mask.size else 0.0
+
+
+def trim_to_voiced(
+    audio: np.ndarray,
+    sr: int,
+    keep_pause_s: float = 0.12,
+    edge_pad_s: float = 0.03,
+) -> np.ndarray:
+    """Drop silence/ambience-only stretches, keeping dense voiced speech.
+
+    Inter-word pauses up to ``keep_pause_s`` are preserved so the reference
+    still sounds like natural speech; longer silences (and ambience-only
+    regions, which read as unvoiced) are removed. A short ``edge_pad_s`` of
+    context is kept around each voiced run to avoid clipping onsets.
+    """
+    mask = _voiced_frame_mask(audio, sr)
+    if not mask.any():
+        return audio
+    _, hop, win = _frame_rms(audio, sr)
+    # Expand frame mask to a per-sample keep mask.
+    keep = np.zeros(audio.shape[0], dtype=bool)
+    pad = int(edge_pad_s * sr)
+    for i, v in enumerate(mask):
+        if not v:
+            continue
+        s = max(0, i * hop - pad)
+        e = min(audio.shape[0], i * hop + win + pad)
+        keep[s:e] = True
+    # Bridge short unkept gaps (<= keep_pause_s) so speech isn't choppy.
+    bridge = int(keep_pause_s * sr)
+    if bridge > 0:
+        idx = np.flatnonzero(keep)
+        if idx.size:
+            prev = idx[0]
+            for j in idx[1:]:
+                if 0 < j - prev <= bridge:
+                    keep[prev:j] = True
+                prev = j
+    out = audio[keep]
+    return out if out.size else audio
+
+
+def denoise_spectral_gate(
+    audio: np.ndarray,
+    sr: int,
+    n_fft: int = 1024,
+    reduction_db: float = 12.0,
+) -> np.ndarray:
+    """Conservative spectral-gating denoise.
+
+    Estimates a noise magnitude profile from the quietest 10% of frames and
+    attenuates (never fully removes) spectral content near that floor. The
+    attenuation is capped at ``reduction_db`` so the speaker's timbre is
+    preserved — over-aggressive subtraction would corrupt the very identity
+    we are trying to clone.
+    """
+    if audio.shape[0] < n_fft:
+        return audio
+    try:
+        import librosa
+    except Exception:
+        return audio
+    hop = n_fft // 4
+    S = librosa.stft(audio.astype("float32"), n_fft=n_fft, hop_length=hop)
+    mag, phase = np.abs(S), np.angle(S)
+    frame_energy = mag.sum(axis=0)
+    if frame_energy.size < 4:
+        return audio
+    quiet = frame_energy <= np.percentile(frame_energy, 10)
+    if not quiet.any():
+        return audio
+    # Pass-through guard: only denoise when a genuine noise floor sits well
+    # below the speech. If the quietest frames are nearly as loud as the
+    # median (a dense, already-clean reference), spectral subtraction would
+    # estimate "noise" from the voice itself and gut the timbre.
+    loud_e = float(np.percentile(frame_energy, 75))
+    quiet_e = float(np.median(frame_energy[quiet]))
+    if quiet_e <= 1e-9 or loud_e / quiet_e < 3.0:
+        return audio
+    noise_mag = np.median(mag[:, quiet], axis=1, keepdims=True)
+    floor = 10.0 ** (-reduction_db / 20.0)
+    # Soft Wiener-style gain: full pass well above noise, floored attenuation near it.
+    snr = mag / (noise_mag + 1e-9)
+    gain = snr ** 2 / (snr ** 2 + 1.0)
+    gain = np.clip(gain, floor, 1.0)
+    out = librosa.istft(gain * mag * np.exp(1j * phase), hop_length=hop, length=audio.shape[0])
+    return out.astype("float32")
+
+
+def purify_reference(audio: np.ndarray, sr: int) -> np.ndarray:
+    """Maximum-purity pass for a cloning reference: trim silence, then denoise.
+
+    Order matters: trimming first removes the silence/ambience pockets that
+    would otherwise dominate the noise-profile estimate, so the subsequent
+    gentle spectral gate targets residual room/crowd bleed under the voice.
+    """
+    trimmed = trim_to_voiced(audio, sr)
+    if trimmed.shape[0] < int(0.3 * sr):
+        trimmed = audio
+    return denoise_spectral_gate(trimmed, sr)
+
+
 @dataclass
 class SpeechChunk:
     """A voiced region inside a diarized segment with quality metrics."""
@@ -39,6 +176,7 @@ class SpeechChunk:
     duration_s: float
     snr: float = 0.0         # estimated signal-to-noise ratio
     rms: float = 0.0         # energy
+    voiced_frac: float = 1.0  # fraction of the chunk that is voiced speech
     score: float = 0.0
 
 
@@ -71,7 +209,19 @@ def _score_chunk(chunk: SpeechChunk) -> float:
     # 4. Continuity (bonus for longer segments that aren't fragments)
     continuity_bonus = 20.0 if chunk.duration_s > 5.0 else 0.0
 
-    return snr_score + dur_score + rms_score + continuity_bonus
+    # 5. Voiced density (purity): a window that is mostly silence or ambience
+    # makes a diluted cloning reference. Reward dense voiced speech and
+    # penalise sparse chunks hard, so the reference is the target voice — not
+    # the pauses around it (Objective #1).
+    vf = chunk.voiced_frac
+    if vf >= 0.7:
+        voiced_score = 25.0
+    elif vf >= 0.4:
+        voiced_score = 25.0 * (vf - 0.4) / 0.3
+    else:
+        voiced_score = -20.0  # actively avoid sparse/contaminated windows
+
+    return snr_score + dur_score + rms_score + continuity_bonus + voiced_score
 
 
 def _collect_speaker_chunks(
@@ -94,17 +244,18 @@ def _collect_speaker_chunks(
         rms = float(np.sqrt(np.mean(clip**2)))
         snr = compute_snr_db(clip)
         dur = (e_abs - s_abs) / sr
-        
+
         if rms < 1e-4:
             continue
-            
+
         chunk = SpeechChunk(
             speaker=speaker,
             start_sample=s_abs,
             end_sample=e_abs,
             duration_s=dur,
             snr=snr,
-            rms=rms
+            rms=rms,
+            voiced_frac=_voiced_frac(clip, sr),
         )
         chunk.score = _score_chunk(chunk)
         out.append(chunk)
@@ -233,9 +384,19 @@ def build_speaker_profiles(
                 ref_parts.append(clip)
             
             ref_audio = np.concatenate(ref_parts)
+            # Maximum-purity pass: strip silence/ambience pockets and gently
+            # denoise residual room/crowd bleed so the embedding sees the
+            # target voice only (Objectives #1/#2).
+            voiced_before = _voiced_frac(ref_audio, sr)
+            ref_audio = purify_reference(ref_audio, sr)
+            voiced_after = _voiced_frac(ref_audio, sr)
             ref_audio = rms_normalize(ref_audio, target_dbfs=-20.0)
             ref_path = prof_dir / "reference.wav"
             write_wav(ref_path, ref_audio, sr)
+            LOG.info(
+                f"  {spk}: purified reference voiced {voiced_before:.2f} -> "
+                f"{voiced_after:.2f} ({ref_audio.shape[0] / sr:.1f}s)"
+            )
 
             transcript = _transcribe_reference(ref_path, source_language, model=whisper_tiny)
             transcript_path = prof_dir / "transcript.txt"
@@ -250,6 +411,7 @@ def build_speaker_profiles(
                 "reference_duration": round(duration_s, 3),
                 "segments_used": len(ref_chunks),
                 "transcript_words": word_count,
+                "voiced_frac": round(voiced_after, 3),
                 "reference_path": str(ref_path),
                 "transcript_path": str(transcript_path),
             }
