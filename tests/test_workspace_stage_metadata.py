@@ -117,7 +117,7 @@ EXPECTED: dict[type, dict] = {
         ],
         "config_fields": [
             "model_id", "target_language", "use_clone_prompt",
-            "max_speed", "max_fit_iters",
+            "max_speed", "max_fit_iters", "tts_backend",
         ],
     },
     AlignStage: {

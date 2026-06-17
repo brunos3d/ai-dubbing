@@ -66,9 +66,14 @@ def _write_segments(path: Path, texts: list[str]) -> None:
 
 
 def _run(tmp_path, speech, speaker_profiles, translated):
+    from src.tts.omnivoice import OmniVoiceSynthesizer
+
     fake = _FakeOmni()
     stage = GenerateStage(tmp_path, target_language="en")
-    stage._load_model = lambda: fake  # type: ignore[method-assign]
+    # Inject the fake OmniVoice model through the pluggable synthesizer seam.
+    stage._make_synthesizer = lambda: OmniVoiceSynthesizer(  # type: ignore[method-assign]
+        language="en", model_obj=fake
+    )
     ctx = {
         "translated_path": str(translated),
         "speech_path": str(speech),

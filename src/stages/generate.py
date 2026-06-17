@@ -11,6 +11,8 @@ import soundfile as sf
 import torch
 
 from ..timing.prosody import analyze_segment, compute_gain, compute_speed
+from ..tts import SpeakerProfile, make_synthesizer
+from ..tts.base import fit_by_speed, next_speed as _next_speed  # re-export (compat)
 from ..utils.audio import read_wav, write_wav
 from ..utils.logging import get_logger, stage_banner
 from ..utils.vram import free_vram, log_vram
@@ -104,29 +106,6 @@ def _transcribe_ref_with_whisper(
     return text
 
 
-def _next_speed(
-    measured: float,
-    slot: float,
-    cur_speed: float,
-    max_speed: float,
-    tol: float,
-) -> Optional[float]:
-    """Next speaking-speed to try, or None when no further pass helps.
-
-    Only *overruns* (speech longer than the slot, which bleed into the next
-    turn) are corrected, by scaling speed up proportionally and clamping to
-    ``max_speed`` for naturalness. Underruns are left as natural pauses.
-    """
-    if slot <= 0 or measured <= 0:
-        return None
-    if measured <= slot * (1.0 + tol):
-        return None  # fits, or underruns -> accept
-    target = min(cur_speed * (measured / slot), max_speed)
-    if target <= cur_speed + 1e-3:
-        return None  # already at the cap; cannot compress further
-    return round(target, 3)
-
-
 def generate_fitted(
     model,
     text: str,
@@ -139,13 +118,11 @@ def generate_fitted(
     max_speed: float = 1.35,
     max_iters: int = 2,
 ):
-    """Synthesize ``text`` so it fits ``slot_s``, iterating on speed.
+    """Compat shim over :func:`src.tts.base.fit_by_speed` for an OmniVoice model.
 
-    Returns ``(audio, sample_rate, final_speed, duration_s, iterations)``.
-    Timing is treated as a generation constraint: we measure the real output
-    and raise OmniVoice's speed to compress overruns, rather than fixing them
-    after the fact with a lossy time-stretch. The best (least-overrun)
-    candidate is returned.
+    Returns ``(audio, sample_rate, final_speed, duration_s, iterations)``. The
+    canonical fitting loop now lives in the backend-agnostic ``tts`` layer; this
+    wrapper keeps the OmniVoice-model call shape used by older callers/tests.
     """
     sr = int(getattr(model, "sampling_rate", _DEFAULT_SR))
 
@@ -161,26 +138,11 @@ def generate_fitted(
             a = a.detach().cpu().numpy()
         return np.asarray(a, dtype=np.float32).reshape(-1)
 
-    speed = float(base_speed)
-    audio = _synth(speed)
-    dur = audio.shape[0] / sr
-    best = (audio, speed, dur)
-    iters = 1
-    for _ in range(max_iters):
-        ns = _next_speed(dur, slot_s, speed, max_speed, tol)
-        if ns is None:
-            break
-        speed = ns
-        audio = _synth(speed)
-        dur = audio.shape[0] / sr
-        iters += 1
-        # Track the candidate with the smallest overrun beyond the slot.
-        if max(0.0, dur - slot_s) < max(0.0, best[2] - slot_s):
-            best = (audio, speed, dur)
-    # If the loop ended on a worse candidate than one seen earlier, use best.
-    if max(0.0, dur - slot_s) > max(0.0, best[2] - slot_s):
-        audio, speed, dur = best
-    return audio, sr, speed, dur, iters
+    seg = fit_by_speed(
+        _synth, sr, slot_s, base_speed=base_speed,
+        tol=tol, max_speed=max_speed, max_iters=max_iters,
+    )
+    return seg.samples, seg.sample_rate, seg.speed, seg.duration_s, seg.iterations
 
 
 def _generate_one(
@@ -223,9 +185,12 @@ class GenerateStage:
         "generated_segments/manifest.json",
         "generated_segments/prosody.json",
     ]
+    # ``tts_backend`` is part of the config so switching it invalidates this
+    # stage (and, via the dependency DAG, align/reconstruct/mix/video) without
+    # touching extract..translate.
     config_fields: List[str] = [
         "model_id", "target_language", "use_clone_prompt",
-        "max_speed", "max_fit_iters",
+        "max_speed", "max_fit_iters", "tts_backend",
     ]
 
     def __init__(
@@ -240,6 +205,10 @@ class GenerateStage:
         max_speed: float = 1.35,
         max_fit_iters: int = 2,
         offload_dir: str = "/tmp/opencode/omnivoice_offload",
+        tts_backend: str = "omnivoice",
+        f5_model: str = "F5TTS_v1_Base",
+        f5_ckpt_file: str = "",
+        f5_vocab_file: str = "",
         subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
@@ -255,48 +224,44 @@ class GenerateStage:
         self.max_speed = max_speed
         self.max_fit_iters = max_fit_iters
         self.offload_dir = offload_dir
+        # Pluggable TTS backend (default: OmniVoice).
+        self.tts_backend = (tts_backend or "omnivoice").strip().lower()
+        self.f5_model = f5_model
+        self.f5_ckpt_file = f5_ckpt_file
+        self.f5_vocab_file = f5_vocab_file
         self.subdir = subdir
+
+    def _make_synthesizer(self):
+        """Build the selected :class:`VoiceSynthesizer` (model loads lazily)."""
+        kwargs: Dict[str, Any] = {
+            "language": self.target_language,
+            "device": self.device,
+            "tolerance": self.duration_tolerance,
+            "max_speed": self.max_speed,
+            "max_fit_iters": self.max_fit_iters,
+        }
+        if self.tts_backend == "omnivoice":
+            kwargs["model_id"] = self.model_id
+            kwargs["offload_dir"] = self.offload_dir
+        elif self.tts_backend == "f5tts":
+            kwargs["model"] = self.f5_model
+            if self.f5_ckpt_file:
+                kwargs["ckpt_file"] = self.f5_ckpt_file
+            if self.f5_vocab_file:
+                kwargs["vocab_file"] = self.f5_vocab_file
+        return make_synthesizer(self.tts_backend, **kwargs)
+
+    def _tts_tag(self) -> str:
+        """Backend-qualified model id for the per-segment render key."""
+        if self.tts_backend == "f5tts":
+            return f"f5tts:{self.f5_model}"
+        return f"{self.tts_backend}:{self.model_id}"
 
     def output_paths(self) -> List[Path]:
         return [self.out_dir]
 
-    def _load_model(self):
-        from omnivoice import OmniVoice
-
-        Path(self.offload_dir).mkdir(parents=True, exist_ok=True)
-        import os
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        try:
-            import torch
-
-            free, _ = torch.cuda.mem_get_info()
-            free_gb = free / (1024 ** 3)
-        except Exception:
-            free_gb = 0.0
-        if free_gb < 3.5:
-            gpu_cap = min(0.9, max(0.6, free_gb - 1.7))
-            LOG.info(
-                f"Only {free_gb:.2f} GB free VRAM; using device_map='auto' with offload "
-                f"(GPU cap {gpu_cap:.1f} GiB for the LLM; audio tokenizer stays on GPU)"
-            )
-            try:
-                return OmniVoice.from_pretrained(
-                    self.model_id,
-                    device_map="auto",
-                    max_memory={0: f"{gpu_cap:.1f}GiB", "cpu": "30GiB"},
-                    dtype=torch.float16,
-                    offload_folder=self.offload_dir,
-                )
-            except Exception as exc:
-                LOG.warning(f"auto device map with max_memory failed: {exc}")
-        return OmniVoice.from_pretrained(
-            self.model_id,
-            device_map=self.device,
-            dtype=torch.float16,
-        )
-
     def run(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        stage_banner(LOG, 7, 11, "OmniVoice Generation")
+        stage_banner(LOG, 7, 11, f"Voice Generation ({self.tts_backend})")
 
         transcript_path = Path(context["translated_path"])
         speech_path = Path(context["speech_path"])
@@ -438,13 +403,13 @@ class GenerateStage:
                 speaker=speaker,
                 target_language=self.target_language,
                 voice_profile_hash=voice_hash.get(speaker, ""),
-                tts_model_id=self.model_id,
+                tts_model_id=self._tts_tag(),
                 slot_duration_s=slot,
                 prosody_signature=str(seg.get("prosody_signature", "")),
             )
 
         manifest: List[Dict[str, Any]] = []
-        model = None
+        synth = None  # VoiceSynthesizer, loaded lazily on first speech segment
         model_sr = _DEFAULT_SR
         reused_count = 0
         synth_count = 0
@@ -502,60 +467,43 @@ class GenerateStage:
                 })
                 continue
 
-            # --- Stable Identity Generation (lazy-load the TTS model) ---
-            if model is None:
-                LOG.info(f"Loading OmniVoice ({self.model_id}) on {self.device}")
-                model = self._load_model()
-                model_sr = int(getattr(model, "sampling_rate", _DEFAULT_SR))
+            # --- Stable Identity Generation (lazy-load the TTS backend) ---
+            if synth is None:
+                synth = self._make_synthesizer()
+                synth.load()
+                model_sr = int(synth.sample_rate)
 
             # We always use the 'primary' profile for each speaker for stability.
             prof_data = speaker_profiles[speaker]["profiles"]["primary"]
-            ref_audio_path = prof_data["reference"]
-            ref_transcript = ref_transcripts.get(speaker, "")
+            profile = SpeakerProfile(
+                speaker_id=speaker,
+                reference_wav=prof_data["reference"],
+                reference_text=ref_transcripts.get(speaker, "") or None,
+            )
 
             LOG.info(
                 f"Segment {i + 1:>3}: speaker={speaker} profile=primary "
                 f"dur={orig_duration:.2f}s text={text[:60]!r}"
             )
 
-            wav, sr = _coerce_ref_audio(ref_audio_path)
             # Honour a prosody-derived speed when present (Phase 5); default 1.0.
             speed = float(seg.get("prosody_speed", 1.0) or 1.0)
 
-            # Timing as a generation constraint (Objective #3): synthesize,
-            # measure, and raise speed to compress overruns until the line fits
-            # its slot — instead of conditioning on the raw slot duration (which
-            # OmniVoice fills by slowing the voice then silence-trimming) and
-            # patching up afterwards with a lossy time-stretch.
-            try:
-                audio, _sr, fit_speed, gen_duration, fit_iters = generate_fitted(
-                    model,
-                    text=text,
-                    language=_lang_name(self.target_language),
-                    ref_audio=(wav, sr),
-                    ref_text=ref_transcript or None,
-                    slot_s=float(orig_duration),
-                    base_speed=speed,
-                    tol=self.duration_tolerance,
-                    max_speed=self.max_speed,
-                    max_iters=self.max_fit_iters,
-                )
-            except Exception as exc:  # noqa: BLE001
-                LOG.warning(f"Segment {i + 1} fitted synthesis failed, falling back: {exc}")
-                audios = model.generate(
-                    text=text,
-                    language=_lang_name(self.target_language),
-                    ref_audio=(wav, sr),
-                    ref_text=ref_transcript or None,
-                )
-                if not audios:
-                    raise RuntimeError(f"OmniVoice produced no audio for segment {i + 1}")
-                audio = audios[0]
-                if isinstance(audio, torch.Tensor):
-                    audio = audio.detach().cpu().numpy()
-                audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-                fit_speed, fit_iters = speed, 1
-                gen_duration = float(audio.shape[0]) / model_sr
+            # Timing as a generation constraint (Objective #3): the backend
+            # synthesizes, measures, and raises speed to fit the slot. This is
+            # backend-agnostic — OmniVoice and F5-TTS both go through the same
+            # VoiceSynthesizer contract.
+            result = synth.generate(
+                text=text,
+                speaker_profile=profile,
+                target_duration=float(orig_duration),
+                base_speed=speed,
+            )
+            audio = result.samples
+            model_sr = int(result.sample_rate)
+            gen_duration = result.duration_s
+            fit_speed = result.speed
+            fit_iters = result.iterations
 
             if fit_iters > 1:
                 LOG.info(
@@ -581,6 +529,7 @@ class GenerateStage:
                 "sample_rate": model_sr,
                 "render_key": rkey,
                 "reused": False,
+                "tts_backend": self.tts_backend,
                 "prosody_speed": float(seg.get("prosody_speed", 1.0) or 1.0),
                 "prosody_gain": float(seg.get("_prosody_gain", 1.0) or 1.0),
                 "prosody": _pros.to_dict() if _pros is not None else {},
@@ -614,10 +563,11 @@ class GenerateStage:
         prosody_path = self.out_dir / "prosody.json"
         prosody_path.write_text(json.dumps(prosody_report, indent=2, ensure_ascii=False))
 
-        try:
-            del model
-        except Exception:
-            pass
+        if synth is not None:
+            try:
+                synth.close()
+            except Exception:
+                pass
         free_vram()
         log_vram(LOG)
         return {

@@ -46,6 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--whisper-model", default="large-v3", help="faster-whisper model size")
     run_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
     run_p.add_argument("--target-lufs", type=float, default=-16.0, help="Loudness target for final mix")
+    run_p.add_argument(
+        "--tts-backend", default="omnivoice", choices=("omnivoice", "f5tts"),
+        help="Text-to-speech backend (default: omnivoice).",
+    )
     run_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
     run_p.add_argument("--start-from", default="extract", help="Stage to start from (for resuming)")
     run_p.add_argument("--only", default=None, help="Run only a single stage (debug)")
@@ -104,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_p.add_argument("--name", default=None, help="Optional override for the workspace slug")
     prepare_p.add_argument("--whisper-model", default="large-v3", help="faster-whisper model size")
     prepare_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
+    prepare_p.add_argument(
+        "--tts-backend", default="omnivoice", choices=("omnivoice", "f5tts"),
+        help="Text-to-speech backend recorded for this workspace (default: omnivoice).",
+    )
     prepare_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
     prepare_p.add_argument(
         "--no-pyannote",
@@ -133,6 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate_p.add_argument("--whisper-model", default="large-v3", help="faster-whisper model size")
     generate_p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated pyannote models")
     generate_p.add_argument("--target-lufs", type=float, default=-16.0, help="Loudness target for final mix")
+    generate_p.add_argument(
+        "--tts-backend", default="omnivoice", choices=("omnivoice", "f5tts"),
+        help="Text-to-speech backend (default: omnivoice). Switching it "
+        "re-runs generate..video without touching extract..translate.",
+    )
     generate_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
     generate_p.add_argument(
         "--no-pyannote",
@@ -269,6 +282,7 @@ def _handle_prepare(args) -> int:
         no_pyannote=args.no_pyannote,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
+        tts_backend=args.tts_backend,
     )
     try:
         wid, root = wsp.prepare()
@@ -310,6 +324,7 @@ def _handle_generate(args) -> int:
         no_pyannote=args.no_pyannote,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
+        tts_backend=args.tts_backend,
     )
     try:
         resolved_wid, root = wsp.generate(
@@ -400,6 +415,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         no_pyannote=args.no_pyannote,
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
+        tts_backend=args.tts_backend,
     )
     try:
         pipeline.run(start_from=args.start_from, only=args.only)
