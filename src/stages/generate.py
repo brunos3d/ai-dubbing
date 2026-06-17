@@ -73,9 +73,11 @@ def _transcribe_ref_with_whisper(
 
     local_model = False
     if model is None:
-        LOG.info(f"Transcribing reference audio with faster-whisper (tiny) -> {ref_audio_path}")
+        from ..utils.asr import resolve_ref_asr
+        size, device, compute = resolve_ref_asr()
+        LOG.info(f"Transcribing reference audio with faster-whisper ({size} on {device}) -> {ref_audio_path}")
         try:
-            model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            model = WhisperModel(size, device=device, compute_type=compute)
             local_model = True
         except Exception as exc:
             LOG.warning(f"Failed to load whisper tiny for reference: {exc}")
@@ -328,13 +330,18 @@ class GenerateStage:
         whisper_tiny = None
         if missing:
             from faster_whisper import WhisperModel
+            from ..utils.asr import resolve_ref_asr
+            size, device, compute = resolve_ref_asr()
             try:
-                whisper_tiny = WhisperModel("tiny", device="cpu", compute_type="int8")
+                whisper_tiny = WhisperModel(size, device=device, compute_type=compute)
             except Exception as exc:
-                LOG.warning(f"Could not load whisper tiny for reference transcription: {exc}")
-                whisper_tiny = None
+                LOG.warning(f"Could not load reference ASR ({size}/{device}): {exc}; trying tiny/cpu")
+                try:
+                    whisper_tiny = WhisperModel("tiny", device="cpu", compute_type="int8")
+                except Exception:
+                    whisper_tiny = None
         else:
-            LOG.info("All speaker references already transcribed; skipping whisper-tiny load")
+            LOG.info("All speaker references already transcribed; skipping reference-ASR load")
 
         try:
             for spk, spk_data in speaker_profiles.items():
