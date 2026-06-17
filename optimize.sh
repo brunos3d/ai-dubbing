@@ -292,30 +292,3 @@ case "$CMD" in
     clean)     cmd_clean ;;
     *)         print_usage ;;
 esac
-s%s\n' "$DIM" "$act" "$RST"
-                last_activity="$act"
-            fi
-        fi
-        sleep "$INTERVAL"
-    done
-    wait "$pypid" 2>/dev/null || true
-    [ -n "${TAILPID:-}" ] && kill "$TAILPID" 2>/dev/null || true
-
-    # Flush any final records that landed between the last poll and exit.
-    if [ -f "$HIST" ]; then
-        print_new_records "$last_count" | grep -v '^__COUNT__' || true
-    fi
-
-    echo "${DIM}────────────────────────────────────────────────────────────${RST}"
-    echo "${BOLD}Final status:${RST}"
-    cmd_status
-}
-
-case "$CMD" in
-    run)    cmd_run ;;
-    status) cmd_status ;;
-    watch)  cmd_watch ;;
-    best)   cmd_best ;;
-    clean)  cmd_clean ;;
-    *)      print_usage ;;
-esac
