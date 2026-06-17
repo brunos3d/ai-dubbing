@@ -117,15 +117,19 @@ def build_ambience_bed(
     output_path: Path,
     sr: int = 48000,
     gap_gain: float = 0.9,
+    reaction_gain: float = 1.0,
+    use_event_classification: bool = True,
 ) -> Path:
-    """Build an ambience bed that preserves audience reactions (Failure #2).
+    """Build a multi-layer ambience bed that preserves audience reactions.
 
-    ``ambience = separated_background + gap_gain * original * non_speech_mask``
+    Three-layer model:
+    1. Separated background (Demucs "other" stem) - base ambience
+    2. Original audio in non-speech gaps - recovers reactions Demucs missed
+    3. Classified reaction events - boosted preservation of laughter/applause
 
-    The separated background carries whatever ambience Demucs kept; the
-    gated original restores laughter/applause that Demucs swept into the
-    vocals stem, but only in the gaps between diarized speech so the
-    original English voice is never reintroduced.
+    When ``use_event_classification`` is True, uses spectral analysis to
+    detect and classify reactions (laughter, applause, cheers) for targeted
+    preservation. Falls back to simple energy-based gating otherwise.
     """
     import numpy as np
     import soundfile as sf
@@ -154,13 +158,72 @@ def build_ambience_bed(
     orig = np.pad(orig, (0, n - orig.shape[0]))
     bg = np.pad(bg, (0, n - bg.shape[0]))
 
-    env = _non_speech_envelope(speech_segments, n, sr, fade_s=0.15)
-    ambience = bg + gap_gain * orig * env
+    if use_event_classification:
+        try:
+            from ..utils.audio_events import classify_audio_layers, save_event_manifest
+            events = classify_audio_layers(orig, sr, speech_segments)
+            ambience = _build_layered_ambience(
+                orig, bg, events, sr, gap_gain, reaction_gain,
+            )
+            LOG.info(
+                f"Multi-layer ambience: {len(events.get('reactions', []))} reactions, "
+                f"{len(events.get('ambience', []))} ambience regions"
+            )
+        except Exception as exc:
+            LOG.warning(f"Event classification failed ({exc}); using simple gating")
+            env = _non_speech_envelope(speech_segments, n, sr, fade_s=0.15)
+            ambience = bg + gap_gain * orig * env
+    else:
+        env = _non_speech_envelope(speech_segments, n, sr, fade_s=0.15)
+        ambience = bg + gap_gain * orig * env
+
     peak = float(np.max(np.abs(ambience))) if ambience.size else 0.0
     if peak > 0.99:
         ambience = ambience * (0.99 / peak)
     sf.write(str(output_path), ambience.astype("float32"), sr)
     return output_path
+
+
+def _build_layered_ambience(
+    orig: np.ndarray,
+    bg: np.ndarray,
+    events: Dict[str, Any],
+    sr: int,
+    gap_gain: float,
+    reaction_gain: float,
+) -> np.ndarray:
+    """Build ambience from classified event layers.
+
+    Layer 1: Demucs background (base ambience, continuous)
+    Layer 2: Original audio in non-speech gaps (recovers missed reactions)
+    Layer 3: Boosted reaction events (laughter, applause, cheers)
+    """
+    import numpy as np
+
+    n = orig.shape[0]
+    ambience = bg.copy()
+
+    speech_segments_list = [e.to_dict() for e in events.get("speech", [])]
+    env = _non_speech_envelope(speech_segments_list, n, sr, fade_s=0.15)
+    ambience = ambience + gap_gain * orig * env
+
+    for reaction in events.get("reactions", []):
+        s = max(0, int(reaction.start * sr))
+        e = min(n, int(reaction.end * sr))
+        if e <= s:
+            continue
+        reaction_audio = orig[s:e]
+        fade_len = min(64, (e - s) // 4)
+        if fade_len > 0:
+            fade_in = np.linspace(0.0, 1.0, fade_len, dtype="float32")
+            fade_out = np.linspace(1.0, 0.0, fade_len, dtype="float32")
+            reaction_audio = reaction_audio.copy()
+            reaction_audio[:fade_len] *= fade_in
+            reaction_audio[-fade_len:] *= fade_out
+        boost = reaction_gain * (0.5 + 0.5 * reaction.intensity)
+        ambience[s:e] += boost * reaction_audio
+
+    return ambience
 
 
 def estimate_reverb(path: Path) -> float:
@@ -270,7 +333,7 @@ class MixStage:
     derived_outputs: List[str] = ["output/final_audio.wav"]
     config_fields: List[str] = [
         "target_lufs", "speech_db", "background_db", "ducking", "room_match",
-        "preserve_audience",
+        "preserve_audience", "reaction_gain",
     ]
 
     def __init__(
@@ -281,6 +344,7 @@ class MixStage:
         ducking: bool = True,
         room_match: bool = True,
         preserve_audience: bool = True,
+        reaction_gain: float = 1.0,
         subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
@@ -290,9 +354,8 @@ class MixStage:
         self.target_lufs = target_lufs
         self.ducking = ducking
         self.room_match = room_match
-        # Recover audience laughter/applause from the original audio in the
-        # gaps between diarized speech (Failure #2).
         self.preserve_audience = preserve_audience
+        self.reaction_gain = reaction_gain
         self.subdir = subdir
 
     def output_paths(self) -> List[Path]:
@@ -328,6 +391,7 @@ class MixStage:
                     ambience_path.parent.mkdir(parents=True, exist_ok=True)
                     build_ambience_bed(
                         Path(original_path), background_path, speech_segments, ambience_path,
+                        reaction_gain=self.reaction_gain,
                     )
                     LOG.info(
                         f"Audience preservation: ambience bed -> {ambience_path} "

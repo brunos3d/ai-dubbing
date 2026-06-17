@@ -35,14 +35,16 @@ import numpy as np
 # priorities (timing, continuity, prosody, endings, speaker identity). They are
 # a plain dict so a caller — or the optimizer config — can override any subset.
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "timing_accuracy": 0.18,
-    "slot_fit": 0.12,
-    "speaker_similarity": 0.18,
-    "speaker_consistency": 0.10,
-    "ending_quality": 0.10,
-    "continuity": 0.12,
-    "prosodic_similarity": 0.10,
-    "reconstruction_quality": 0.10,
+    "timing_accuracy": 0.15,
+    "slot_fit": 0.10,
+    "speaker_similarity": 0.15,
+    "speaker_consistency": 0.08,
+    "ending_quality": 0.08,
+    "continuity": 0.10,
+    "prosodic_similarity": 0.09,
+    "reconstruction_quality": 0.08,
+    "ambience_preservation": 0.09,
+    "reaction_preservation": 0.08,
 }
 
 
@@ -415,6 +417,210 @@ def reconstruction_quality(workspace_root: Path) -> Tuple[Optional[float], Dict[
     }
 
 
+def ambience_preservation(workspace_root: Path) -> Tuple[Optional[float], Dict[str, Any]]:
+    """Measure how well the dub preserves the original ambience/reactions.
+
+    Compares the original audio (with speech masked out) to the final mixed
+    audio (with synthesized speech masked out). High correlation in the
+    non-speech regions indicates good ambience preservation.
+
+    Components:
+    * **energy envelope correlation** — how well the energy contour matches
+      in non-speech regions
+    * **spectral similarity** — how well the spectral content matches
+    """
+    original_path = workspace_root / "media" / "original_audio.wav"
+    final_path = workspace_root / "output" / "final_audio.wav"
+    manifest_path = workspace_root / "aligned_manifest.json"
+
+    if not original_path.exists() or not final_path.exists():
+        return None, {}
+
+    orig, osr = _read_mono(original_path)
+    final, fsr = _read_mono(final_path)
+
+    if orig is None or final is None:
+        return None, {}
+
+    # Load manifest to get speech segment timings
+    speech_segments = []
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            speech_segments = [
+                (float(e.get("start", 0)), float(e.get("end", 0)))
+                for e in manifest
+                if not e.get("is_non_speech")
+            ]
+        except Exception:
+            pass
+
+    # Resample to common rate for comparison
+    target_sr = min(osr, fsr, 16000)
+    try:
+        import librosa
+        if osr != target_sr:
+            orig = librosa.resample(orig.astype("float32"), orig_sr=osr, target_sr=target_sr)
+        if fsr != target_sr:
+            final = librosa.resample(final.astype("float32"), orig_sr=fsr, target_sr=target_sr)
+        sr = target_sr
+    except Exception:
+        sr = osr
+
+    # Build non-speech mask
+    n = min(orig.size, final.size)
+    orig = orig[:n]
+    final = final[:n]
+
+    is_speech = np.zeros(n, dtype=bool)
+    for start, end in speech_segments:
+        s = max(0, int(start * sr))
+        e = min(n, int(end * sr))
+        is_speech[s:e] = True
+
+    non_speech_mask = ~is_speech
+    if non_speech_mask.sum() < int(0.5 * sr):  # Need at least 0.5s of non-speech
+        return None, {"reason": "insufficient_non_speech"}
+
+    orig_nonspeech = orig[non_speech_mask]
+    final_nonspeech = final[non_speech_mask]
+
+    # Energy envelope correlation
+    frame_ms = 50.0
+    win = max(1, int(frame_ms / 1000.0 * sr))
+    hop = win // 2
+
+    def _frame_energy(x):
+        if x.size < win:
+            return np.array([np.sqrt(np.mean(x ** 2))])
+        n_frames = 1 + (x.size - win) // hop
+        energy = np.empty(n_frames, dtype="float32")
+        for i in range(n_frames):
+            energy[i] = np.sqrt(np.mean(x[i * hop:i * hop + win] ** 2))
+        return energy
+
+    orig_energy = _frame_energy(orig_nonspeech)
+    final_energy = _frame_energy(final_nonspeech)
+
+    min_len = min(orig_energy.size, final_energy.size)
+    if min_len < 3:
+        return None, {"reason": "too_short"}
+
+    energy_corr = _pearson(orig_energy[:min_len], final_energy[:min_len])
+    energy_score = (energy_corr + 1.0) / 2.0 if energy_corr is not None else 0.5
+
+    # Spectral similarity (log-mel envelope)
+    orig_env = _logmel_envelope(orig_nonspeech, sr)
+    final_env = _logmel_envelope(final_nonspeech, sr)
+
+    spectral_score: Optional[float] = None
+    if orig_env is not None and final_env is not None and orig_env.shape == final_env.shape:
+        r = _pearson(orig_env, final_env)
+        if r is not None:
+            spectral_score = (r + 1.0) / 2.0
+
+    components = [energy_score]
+    if spectral_score is not None:
+        components.append(spectral_score)
+
+    score = float(np.mean(components))
+    return score, {
+        "energy_correlation": round(energy_score, 4),
+        "spectral_similarity": (round(spectral_score, 4) if spectral_score is not None else None),
+        "non_speech_seconds": round(non_speech_mask.sum() / sr, 2),
+    }
+
+
+def reaction_preservation(workspace_root: Path) -> Tuple[Optional[float], Dict[str, Any]]:
+    """Measure how well audience reactions (laughter, applause) are preserved.
+
+    Detects reaction events in the original audio and checks if they appear
+    in the final mixed audio at similar times and intensities.
+
+    Components:
+    * **occurrence match** — are reactions present at similar times?
+    * **intensity match** — are reaction intensities similar?
+    """
+    original_path = workspace_root / "media" / "original_audio.wav"
+    final_path = workspace_root / "output" / "final_audio.wav"
+    manifest_path = workspace_root / "aligned_manifest.json"
+
+    if not original_path.exists() or not final_path.exists():
+        return None, {}
+
+    orig, osr = _read_mono(original_path)
+    final, fsr = _read_mono(final_path)
+
+    if orig is None or final is None:
+        return None, {}
+
+    # Load speech segments
+    speech_segments = []
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            speech_segments = [
+                {"start": float(e.get("start", 0)), "end": float(e.get("end", 0))}
+                for e in manifest
+                if not e.get("is_non_speech")
+            ]
+        except Exception:
+            pass
+
+    if not speech_segments:
+        return None, {"reason": "no_speech_segments"}
+
+    # Detect reactions in original
+    try:
+        from ..utils.audio_events import detect_reactions
+        orig_reactions = detect_reactions(orig, osr, speech_segments)
+        final_reactions = detect_reactions(final, fsr, speech_segments)
+    except Exception:
+        return None, {"reason": "detection_failed"}
+
+    if not orig_reactions:
+        # No reactions in original - perfect preservation trivially
+        return 1.0, {"n_original": 0, "n_final": 0, "note": "no_reactions_in_source"}
+
+    # Match reactions by temporal overlap
+    matched = 0
+    intensity_scores = []
+
+    for orig_r in orig_reactions:
+        # Find best matching final reaction
+        best_overlap = 0.0
+        best_final = None
+        for final_r in final_reactions:
+            overlap_start = max(orig_r.start, final_r.start)
+            overlap_end = min(orig_r.end, final_r.end)
+            if overlap_end > overlap_start:
+                overlap = overlap_end - overlap_start
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_final = final_r
+
+        if best_overlap > 0.1:  # At least 100ms overlap
+            matched += 1
+            if best_final is not None:
+                # Compare intensities
+                intensity_diff = abs(orig_r.intensity - best_final.intensity)
+                intensity_scores.append(1.0 - min(1.0, intensity_diff))
+
+    occurrence_score = matched / len(orig_reactions) if orig_reactions else 0.0
+    intensity_score = float(np.mean(intensity_scores)) if intensity_scores else 0.5
+
+    # Combined score: 60% occurrence, 40% intensity
+    score = 0.6 * occurrence_score + 0.4 * intensity_score
+
+    return score, {
+        "n_original": len(orig_reactions),
+        "n_final": len(final_reactions),
+        "n_matched": matched,
+        "occurrence_score": round(occurrence_score, 4),
+        "intensity_score": round(intensity_score, 4),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
@@ -474,6 +680,8 @@ def compute_metrics(
     end, e_det = ending_quality(manifest)
     pros, p_det = prosodic_similarity(manifest)
     recon, r_det = reconstruction_quality(workspace_root)
+    ambience, amb_det = ambience_preservation(workspace_root)
+    reaction, react_det = reaction_preservation(workspace_root)
 
     result.metrics = {
         "timing_accuracy": t_acc,
@@ -484,6 +692,8 @@ def compute_metrics(
         "ending_quality": end,
         "prosodic_similarity": pros,
         "reconstruction_quality": recon,
+        "ambience_preservation": ambience,
+        "reaction_preservation": reaction,
     }
     result.details = {
         "timing_accuracy": t_det,
@@ -493,6 +703,8 @@ def compute_metrics(
         "ending_quality": e_det,
         "prosodic_similarity": p_det,
         "reconstruction_quality": r_det,
+        "ambience_preservation": amb_det,
+        "reaction_preservation": react_det,
         "n_manifest_entries": len(manifest),
     }
     result.composite = score_from_metrics(result.metrics, weights)

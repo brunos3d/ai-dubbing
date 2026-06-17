@@ -78,7 +78,7 @@ EXPECTED: dict[type, dict] = {
             "speakers/speaker_01/primary.txt",
         ],
         "derived_outputs": [],
-        "config_fields": ["target_seconds", "max_seconds"],
+        "config_fields": ["target_seconds", "max_seconds", "aggressive_purification"],
     },
     TranscribeStage: {
         "inputs": ["media/speech.wav", "diarization/segments.json"],
@@ -118,6 +118,10 @@ EXPECTED: dict[type, dict] = {
         "config_fields": [
             "model_id", "target_language", "use_clone_prompt",
             "max_speed", "max_fit_iters", "tts_backend",
+            "num_step", "denoise", "guidance_scale", "t_shift",
+            "position_temperature", "class_temperature",
+            "preprocess_prompt", "postprocess_output", "tail_padding_s",
+            "audio_chunk_duration", "audio_chunk_threshold",
         ],
     },
     AlignStage: {
@@ -152,7 +156,7 @@ EXPECTED: dict[type, dict] = {
         "derived_outputs": ["output/final_audio.wav"],
         "config_fields": [
             "target_lufs", "speech_db", "background_db", "ducking", "room_match",
-            "preserve_audience",
+            "preserve_audience", "reaction_gain",
         ],
     },
     VideoStage: {

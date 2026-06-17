@@ -35,9 +35,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from ..utils.logging import get_logger
 from ..workspace.dag import STAGE_ORDER
 from .metrics import DEFAULT_WEIGHTS, MetricResult, compute_metrics
 from .parameter_space import changed_params, earliest_stage, to_stage_overrides
+
+LOG = get_logger("ai-dubbing.optimizer.evaluator")
+
+
+def _is_oom(exc: Exception) -> bool:
+    """Check if an exception is a CUDA out-of-memory error."""
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda" in msg and "oom" in msg
+
+
+def _free_vram_quiet() -> None:
+    """Free VRAM without logging."""
+    try:
+        from ..utils.vram import free_vram
+        free_vram()
+    except Exception:
+        pass
 
 
 @dataclass

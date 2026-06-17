@@ -167,6 +167,44 @@ def purify_reference(audio: np.ndarray, sr: int) -> np.ndarray:
     return denoise_spectral_gate(trimmed, sr)
 
 
+def purify_reference_aggressive(
+    audio: np.ndarray,
+    sr: int,
+    reduction_db: float = 18.0,
+    min_voiced_frac: float = 0.6,
+) -> np.ndarray:
+    """Aggressive purification for cloning references.
+
+    More aggressive than purify_reference:
+    - Stricter voiced fraction threshold
+    - Stronger spectral gating (higher reduction_db)
+    - Removes more background contamination
+
+    Use this when maximum speaker purity is needed for voice cloning,
+    even at the cost of some naturalness.
+    """
+    trimmed = trim_to_voiced(audio, sr, keep_pause_s=0.08, edge_pad_s=0.02)
+    if trimmed.shape[0] < int(0.3 * sr):
+        trimmed = audio
+
+    # Check voiced fraction - if too low, the reference is contaminated
+    vf = _voiced_frac(trimmed, sr)
+    if vf < min_voiced_frac:
+        LOG.warning(
+            f"Reference voiced fraction {vf:.2f} below threshold {min_voiced_frac}; "
+            "aggressive purification may not be effective"
+        )
+
+    # Apply stronger spectral gating
+    purified = denoise_spectral_gate(trimmed, sr, reduction_db=reduction_db)
+
+    # Additional pass: remove any remaining low-energy regions that might
+    # contain audience reactions or ambience
+    purified = trim_to_voiced(purified, sr, keep_pause_s=0.05, edge_pad_s=0.01)
+
+    return purified
+
+
 @dataclass
 class SpeechChunk:
     """A voiced region inside a diarized segment with quality metrics."""
@@ -310,11 +348,17 @@ def build_speaker_profiles(
     target_seconds: float = 10.0,
     max_seconds: float = 15.0,
     flat_dir: Optional[Path] = None,
+    aggressive_purification: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     """Build high-quality voice profiles per speaker.
 
     Instead of clustering, we pick the best candidate reference window
     to ensure stable identity.
+
+    When ``aggressive_purification`` is True, uses stronger denoising to
+    remove audience reactions and background contamination from cloning
+    references. This produces cleaner speaker identities at the cost of
+    some naturalness.
     """
     profiles_dir.mkdir(parents=True, exist_ok=True)
     if flat_dir is not None:
@@ -398,7 +442,10 @@ def build_speaker_profiles(
             # denoise residual room/crowd bleed so the embedding sees the
             # target voice only (Objectives #1/#2).
             voiced_before = _voiced_frac(ref_audio, sr)
-            ref_audio = purify_reference(ref_audio, sr)
+            if aggressive_purification:
+                ref_audio = purify_reference_aggressive(ref_audio, sr)
+            else:
+                ref_audio = purify_reference(ref_audio, sr)
             voiced_after = _voiced_frac(ref_audio, sr)
             ref_audio = rms_normalize(ref_audio, target_dbfs=-20.0)
             ref_path = prof_dir / "reference.wav"
@@ -406,6 +453,7 @@ def build_speaker_profiles(
             LOG.info(
                 f"  {spk}: purified reference voiced {voiced_before:.2f} -> "
                 f"{voiced_after:.2f} ({ref_audio.shape[0] / sr:.1f}s)"
+                f"{' [aggressive]' if aggressive_purification else ''}"
             )
 
             transcript = _transcribe_reference(ref_path, source_language, model=whisper_tiny)
@@ -474,13 +522,14 @@ class SampleStage:
         "speakers/speaker_01/primary.txt",
     ]
     derived_outputs: List[str] = []
-    config_fields: List[str] = ["target_seconds", "max_seconds"]
+    config_fields: List[str] = ["target_seconds", "max_seconds", "aggressive_purification"]
 
     def __init__(
         self,
         workdir: Path,
         target_seconds: float = 10.0,
         max_seconds: float = 15.0,
+        aggressive_purification: bool = True,
         subdir: str | None = None,
     ):
         self.workdir = Path(workdir)
@@ -488,6 +537,7 @@ class SampleStage:
             self.workdir = self.workdir / subdir
         self.target_seconds = target_seconds
         self.max_seconds = max_seconds
+        self.aggressive_purification = aggressive_purification
         self.subdir = subdir
 
     def output_paths(self) -> List[Path]:
@@ -510,6 +560,7 @@ class SampleStage:
             target_seconds=self.target_seconds,
             max_seconds=self.max_seconds,
             flat_dir=flat_dir,
+            aggressive_purification=self.aggressive_purification,
         )
 
         # Backwards-compatible mapping
