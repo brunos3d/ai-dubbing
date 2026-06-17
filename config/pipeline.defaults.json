@@ -1,0 +1,10 @@
+{
+  "samples.target_seconds": 10.0,
+  "samples.max_seconds": 15.0,
+  "generate.duration_tolerance": 0.10,
+  "generate.max_speed": 1.35,
+  "generate.max_fit_iters": 2,
+  "generate.use_clone_prompt": true,
+  "align.tolerance": 0.10,
+  "align.min_abs_correction_s": 0.12
+}

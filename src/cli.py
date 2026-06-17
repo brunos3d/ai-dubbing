@@ -51,6 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Text-to-speech backend (default: omnivoice).",
     )
     run_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
+    run_p.add_argument("--best", "--optimize-config", dest="optimize_config", help="Path to a best.json optimization artifact to use for this run")
     run_p.add_argument("--start-from", default="extract", help="Stage to start from (for resuming)")
     run_p.add_argument("--only", default=None, help="Run only a single stage (debug)")
     
@@ -113,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Text-to-speech backend recorded for this workspace (default: omnivoice).",
     )
     prepare_p.add_argument("--glossary", help="Path to entity_glossary.json for preserving names/brands")
+    prepare_p.add_argument("--best", "--optimize-config", dest="optimize_config", help="Path to a best.json optimization artifact to use for this run")
     prepare_p.add_argument(
         "--no-pyannote",
         action="store_true",
@@ -134,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     generate_p.add_argument("--from-stage", default=None, help="Force a run starting at this stage")
     generate_p.add_argument("--to-stage", default=None, help="Cap the run at this stage (inclusive)")
+    generate_p.add_argument("--best", "--optimize-config", dest="optimize_config", help="Path to a best.json optimization artifact to use for this run")
     generate_p.add_argument("--force", action="store_true", help="Re-run every stage regardless of staleness")
     generate_p.add_argument("--output-dir", "-o", default="output", help="Where to write final outputs (relative to workspace)")
     
@@ -284,6 +287,23 @@ def _handle_prepare(args) -> int:
         max_speakers=args.max_speakers,
         tts_backend=args.tts_backend,
     )
+    
+    # Inject optimization parameters if provided.
+    if getattr(args, "optimize_config", None):
+        opt_path = Path(args.optimize_config)
+        if opt_path.exists():
+            try:
+                opt_data = json.loads(opt_path.read_text(encoding="utf-8"))
+                params = opt_data.get("parameters", {})
+                from .optimization.parameter_space import to_stage_overrides
+                wsp.stage_overrides.update(to_stage_overrides(params))
+                # Record the source in the pipeline context for metadata tracking
+                wsp._optimization_source = str(opt_path.resolve())
+                wsp._optimization_iteration = opt_data.get("iteration")
+                wsp._optimization_score = opt_data.get("score")
+            except Exception as exc:
+                print(f"Warning: Failed to load optimization config {opt_path}: {exc}", file=sys.stderr)
+
     try:
         wid, root = wsp.prepare()
     except Exception as exc:  # noqa: BLE001
@@ -398,6 +418,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     emit = _resolve_emit(args, src_suffix)
     skip_video = emit == "audio"
 
+    stage_overrides = None
+    opt_source = None
+    opt_iteration = None
+    opt_score = None
+
+    if getattr(args, "optimize_config", None):
+        opt_path = Path(args.optimize_config)
+        if opt_path.exists():
+            try:
+                opt_data = json.loads(opt_path.read_text(encoding="utf-8"))
+                params = opt_data.get("parameters", {})
+                from .optimization.parameter_space import to_stage_overrides
+                stage_overrides = to_stage_overrides(params)
+                opt_source = str(opt_path.resolve())
+                opt_iteration = opt_data.get("iteration")
+                opt_score = opt_data.get("score")
+            except Exception as exc:
+                print(f"Warning: Failed to load optimization config {opt_path}: {exc}", file=sys.stderr)
+
     pipeline = Pipeline(
         input_path=str(Path(args.input).resolve()),
         source_language=args.source_language,
@@ -416,6 +455,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         min_speakers=args.min_speakers,
         max_speakers=args.max_speakers,
         tts_backend=args.tts_backend,
+        stage_overrides=stage_overrides,
+        optimization_source=opt_source,
+        optimization_iteration=opt_iteration,
+        optimization_score=opt_score,
     )
     try:
         pipeline.run(start_from=args.start_from, only=args.only)

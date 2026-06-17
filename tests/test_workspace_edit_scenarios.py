@@ -235,10 +235,11 @@ def install_stubs(monkeypatch, record):
         glossary_path,
         target_lufs,
         tts_backend="omnivoice",
+        stage_overrides=None,
     ):
         cls = wsp_mod.STAGE_CLASSES[name]
         subdir = wsp_mod.stage_subdir(name)
-        return cls(
+        stage = cls(
             workspace_root,
             no_pyannote=no_pyannote,
             hf_token=hf_token,
@@ -252,6 +253,7 @@ def install_stubs(monkeypatch, record):
             tts_backend=tts_backend,
             subdir=subdir,
         )
+        return wsp_mod._apply_stage_overrides(stage, name, stage_overrides)
 
     monkeypatch.setattr(wsp_mod, "_build_stage", patched_build_stage)
 

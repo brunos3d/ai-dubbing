@@ -54,6 +54,7 @@ from .dag import CliOverrides, STAGE_ORDER, compute_stale_set
 from .manifest import ArtifactRef, Manifest, StageRecord
 from .paths import slugify, workspace_id, workspaces_root
 from .timeline import refresh_timeline
+from ..utils.config import load_pipeline_defaults
 
 LOG = get_logger("ai-dubbing.workspace")
 
@@ -274,6 +275,30 @@ def load_speaker_profiles_from_disk(workspace_root: Path) -> Dict[str, Any]:
     return out
 
 
+def _apply_stage_overrides(
+    stage: Any,
+    name: str,
+    stage_overrides: Optional[Dict[str, Dict[str, Any]]],
+) -> Any:
+    """Set tunable attributes on a freshly-built stage from ``stage_overrides``.
+
+    The optimization subsystem (``src/optimization``) drives the pipeline by
+    overriding per-stage tunables (e.g. ``generate.max_speed``,
+    ``align.tolerance``, ``samples.target_seconds``).  These are all simple
+    scalar attributes read at ``run()`` time, so setting them after
+    construction is safe and avoids widening every stage constructor.
+
+    Only attributes the stage already declares (``hasattr``) are set, so an
+    unknown/typo'd override is ignored rather than silently attached.
+    """
+    if not stage_overrides:
+        return stage
+    for key, value in (stage_overrides.get(name) or {}).items():
+        if hasattr(stage, key):
+            setattr(stage, key, value)
+    return stage
+
+
 def _build_stage(
     name: str,
     workspace_root: Path,
@@ -288,6 +313,7 @@ def _build_stage(
     glossary_path: Optional[Path],
     target_lufs: float,
     tts_backend: str = "omnivoice",
+    stage_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     """Instantiate the right stage class with the right constructor kwargs.
 
@@ -297,61 +323,67 @@ def _build_stage(
     is the workspace's ``output/`` subdir, and the ``input_path`` for the
     video stage is the original media (re-symlinked under ``source/`` by
     :meth:`WorkspacePipeline.prepare`).
+
+    ``stage_overrides`` (optional) is a ``{stage_name: {attr: value}}`` map
+    applied after construction; see :func:`_apply_stage_overrides`.
     """
     subdir = stage_subdir(name)
     output_dir = workspace_root / "output"
 
+    def _ov(stage):
+        return _apply_stage_overrides(stage, name, stage_overrides)
+
     if name == "extract":
-        return ExtractStage(workspace_root, subdir=subdir)
+        return _ov(ExtractStage(workspace_root, subdir=subdir))
     if name == "separate":
-        return SeparateStage(workspace_root, subdir=subdir)
+        return _ov(SeparateStage(workspace_root, subdir=subdir))
     if name == "diarize":
-        return DiarizeStage(
+        return _ov(DiarizeStage(
             workspace_root,
             hf_token=hf_token,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             no_pyannote=no_pyannote,
             subdir=subdir,
-        )
+        ))
     if name == "samples":
-        return SampleStage(workspace_root, subdir=subdir)
+        return _ov(SampleStage(workspace_root, subdir=subdir))
     if name == "transcribe":
-        return TranscribeStage(
+        return _ov(TranscribeStage(
             workspace_root,
             model_size=whisper_model,
             source_language=source_language,
             subdir=subdir,
-        )
+        ))
     if name == "translate":
-        return TranslateStage(
+        return _ov(TranslateStage(
             workspace_root,
             source_language,
             target_language,
             glossary_path=glossary_path,
             subdir=subdir,
-        )
+        ))
     if name == "generate":
-        return GenerateStage(
+        return _ov(GenerateStage(
             workspace_root,
             target_language=target_language,
             tts_backend=tts_backend,
             subdir=subdir,
-        )
+        ))
     if name == "align":
-        return AlignStage(workspace_root, target_language=target_language, subdir=subdir)
+        return _ov(AlignStage(workspace_root, target_language=target_language, subdir=subdir))
     if name == "reconstruct":
-        return ReconstructStage(workspace_root, output_dir, subdir=subdir)
+        return _ov(ReconstructStage(workspace_root, output_dir, subdir=subdir))
     if name == "mix":
-        return MixStage(workspace_root, output_dir, target_lufs=target_lufs, subdir=subdir)
+        return _ov(MixStage(workspace_root, output_dir, target_lufs=target_lufs, subdir=subdir))
     if name == "video":
         source_media = _find_source_media(workspace_root)
-        return VideoStage(
+        return _ov(VideoStage(
             workspace_root,
             output_dir,
             str(source_media) if source_media else str(workspace_root / "source"),
             subdir=subdir,
-        )
+        ))
     raise KeyError(f"unknown stage: {name!r}")
 
 
@@ -450,6 +482,7 @@ class WorkspacePipeline:
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None,
         tts_backend: str = "omnivoice",
+        stage_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         workspace_root: Optional[Path] = None,
         output_dir: Optional[Path] = None,
     ) -> None:
@@ -467,8 +500,43 @@ class WorkspacePipeline:
         # it invalidates generate..video on change but does NOT participate in
         # the workspace-identity hash (extract..translate stay valid).
         self.tts_backend = (tts_backend or "omnivoice").strip().lower()
+        # Per-stage tunable overrides ``{stage: {attr: value}}`` applied at
+        # build time. Used by the optimization subsystem to explore parameter
+        # configurations. These are deliberately NOT part of the workspace
+        # identity hash (``_config``), so changing them keeps the same
+        # workspace and only re-runs the affected stages via the DAG; but they
+        # ARE surfaced in ``_current_configs`` so that invalidation fires.
+        self.stage_overrides: Dict[str, Dict[str, Any]] = stage_overrides or {}
+        
+        # Optimization source tracking for reproducibility
+        self._optimization_source: Optional[str] = None
+        self._optimization_iteration: Optional[int] = None
+        self._optimization_score: Optional[float] = None
+
+        # Load registry defaults if not explicitly overridden.
+        self._apply_registry_defaults()
+
         self._workspace_root_override = workspace_root
         self._output_dir_override = output_dir
+
+    def _apply_registry_defaults(self) -> None:
+        """Load defaults from the centralized registry and merge them into stage_overrides.
+        
+        Explicitly provided stage_overrides win over registry defaults.
+        """
+        defaults = load_pipeline_defaults()
+        if not defaults:
+            return
+            
+        from ..optimization.parameter_space import to_stage_overrides
+        registry_overrides = to_stage_overrides(defaults)
+        
+        for stage, attrs in registry_overrides.items():
+            if stage not in self.stage_overrides:
+                self.stage_overrides[stage] = {}
+            for attr, val in attrs.items():
+                if attr not in self.stage_overrides[stage]:
+                    self.stage_overrides[stage][attr] = val
 
     # -- configuration / identity helpers --------------------------------
 
@@ -501,8 +569,12 @@ class WorkspacePipeline:
         for name in STAGE_ORDER:
             cls = STAGE_CLASSES.get(name)
             if cls:
+                overrides = self.stage_overrides.get(name, {})
                 configs[name] = {
-                    k: getattr(self, k, None)
+                    # An explicit per-stage override wins over the pipeline
+                    # attribute so the DAG sees a config change and re-runs the
+                    # stage (and its downstream consumers).
+                    k: overrides[k] if k in overrides else getattr(self, k, None)
                     for k in getattr(cls, "config_fields", [])
                 }
         return configs
@@ -896,6 +968,12 @@ class WorkspacePipeline:
             "config": {**self._config(), "tts_backend": self.tts_backend},
             "pipeline_config_hash": cfg_hash,
         }
+
+        if self._optimization_source:
+            payload["optimization_source"] = self._optimization_source
+            payload["optimization_iteration"] = self._optimization_iteration
+            payload["optimization_score"] = self._optimization_score
+
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         meta_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -1006,6 +1084,7 @@ class WorkspacePipeline:
             glossary_path=self.glossary_path,
             target_lufs=self.target_lufs,
             tts_backend=self.tts_backend,
+            stage_overrides=self.stage_overrides,
         )
         # Redirect the stage's writes into the staging dir.
         subdir = stage_subdir(name)
@@ -1172,6 +1251,7 @@ class WorkspacePipeline:
             glossary_path=self.glossary_path,
             target_lufs=self.target_lufs,
             tts_backend=self.tts_backend,
+            stage_overrides=self.stage_overrides,
         )
         subdir = stage_subdir(name)
         stage.workdir = staging / subdir if subdir else staging
