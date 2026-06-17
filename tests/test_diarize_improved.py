@@ -207,3 +207,40 @@ def test_chunk_to_label_remap_is_contiguous_from_zero() -> None:
     assert remapped[0] == remapped[1] == remapped[2]
     assert remapped[3] == remapped[4]
     assert remapped[5] != remapped[0]
+
+
+def test_choose_k_margin_rejects_weak_extra_cluster() -> None:
+    """A marginal composite gain over the pyannote prior must not add a speaker.
+
+    Evidence (Elon/Colbert workspace): pyannote found 2 speakers, the
+    re-clusterer's composite rose only 0.259 -> 0.341 (gap 0.082) at k=3 — a
+    spurious split from audience/overlap chunks. The margin guard keeps k=2.
+    """
+    from src.stages.diarize import _choose_k_with_margin
+
+    trace = [
+        {"k": 2, "composite": 0.259},
+        {"k": 3, "composite": 0.341},
+        {"k": 4, "composite": 0.321},
+    ]
+    assert _choose_k_with_margin(trace, base_k=2, margin=0.15) == 2
+
+
+def test_choose_k_margin_keeps_clear_extra_cluster() -> None:
+    """A large composite gain (a genuine speaker) is honoured."""
+    from src.stages.diarize import _choose_k_with_margin
+
+    trace = [
+        {"k": 2, "composite": 0.66},
+        {"k": 3, "composite": 0.899},  # +0.239 — a real third voice
+        {"k": 4, "composite": 0.61},
+    ]
+    assert _choose_k_with_margin(trace, base_k=2, margin=0.15) == 3
+
+
+def test_choose_k_margin_never_below_floor() -> None:
+    from src.stages.diarize import _choose_k_with_margin
+
+    trace = [{"k": 3, "composite": 0.5}, {"k": 4, "composite": 0.52}]
+    # best is k=4 but only +0.02 over the floor -> stay at the floor (3).
+    assert _choose_k_with_margin(trace, base_k=3, margin=0.15) == 3

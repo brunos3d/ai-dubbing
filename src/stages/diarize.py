@@ -220,6 +220,10 @@ DEFAULT_MERGE_THRESHOLD: float = 0.30
 DEFAULT_MIN_DUR_FOR_MERGE: float = 2.0
 DEFAULT_K_MAX: int = 8
 LOW_CONFIDENCE_THRESHOLD: float = 0.6
+# Minimum composite-score gain required to add a speaker beyond the pyannote
+# prior (Objective #4 stability guard). Set between an observed spurious split
+# (~0.08) and a genuine extra speaker (~0.24).
+DEFAULT_K_MARGIN: float = 0.15
 
 
 def _knee_select(
@@ -363,7 +367,40 @@ def _select_k(
                 f"k={best[0]} - going with composite"
             )
 
-    return best[0], trace
+    # Stability guard (Objective #4): only exceed the pyannote prior (k_min)
+    # when the composite gain is clearly worth it. Audience/overlap chunks
+    # otherwise inflate a clean 2-speaker interview to 3, spawning a phantom
+    # speaker. The margin is set between the observed spurious gain (~0.08) and
+    # a genuine extra-speaker gain (~0.24).
+    chosen = _choose_k_with_margin(trace, k_min, DEFAULT_K_MARGIN)
+    if chosen != best[0]:
+        LOG.info(
+            f"K-selection margin guard: composite-best k={best[0]} kept at "
+            f"k={chosen} (gain below {DEFAULT_K_MARGIN} over prior k={k_min})"
+        )
+    return chosen, trace
+
+
+def _choose_k_with_margin(
+    trace: List[Dict[str, Any]], base_k: int, margin: float
+) -> int:
+    """Pick the composite-best k, but only exceed ``base_k`` past a margin.
+
+    ``base_k`` is the trusted prior (the pyannote count / user floor). Going
+    above it requires the composite to improve by at least ``margin`` over the
+    composite at ``base_k``; otherwise the extra cluster is treated as noise
+    and ``base_k`` is kept. Never returns below ``base_k``.
+    """
+    if not trace:
+        return base_k
+    comp = {int(r["k"]): float(r["composite"]) for r in trace}
+    best_k = max(comp, key=lambda k: comp[k])
+    if best_k <= base_k:
+        return max(best_k, base_k)
+    base_comp = comp.get(base_k, comp[min(comp)])
+    if comp[best_k] - base_comp < margin:
+        return base_k
+    return best_k
 
 
 def _relabel_clusters(labels: np.ndarray) -> np.ndarray:
