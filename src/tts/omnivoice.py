@@ -53,6 +53,20 @@ class OmniVoiceSynthesizer(VoiceSynthesizer):
         max_speed: float = 1.35,
         max_fit_iters: int = 2,
         model_obj: Any = None,
+        # Decoding
+        num_step: int = 32,
+        denoise: bool = True,
+        guidance_scale: float = 2.0,
+        t_shift: float = 0.1,
+        # Sampling
+        position_temperature: float = 5.0,
+        class_temperature: float = 0.0,
+        # Pre/Post Processing
+        preprocess_prompt: bool = True,
+        postprocess_output: bool = True,
+        tail_padding_s: float = 0.1,
+        audio_chunk_duration: float = 15.0,
+        audio_chunk_threshold: float = 30.0,
     ) -> None:
         super().__init__(
             language=language, device=device, tolerance=tolerance,
@@ -65,6 +79,18 @@ class OmniVoiceSynthesizer(VoiceSynthesizer):
         self._model_sr = int(getattr(model_obj, "sampling_rate", _DEFAULT_SR)) if model_obj is not None else _DEFAULT_SR
         if model_obj is not None:
             self._loaded = True
+
+        self.num_step = num_step
+        self.denoise = denoise
+        self.guidance_scale = guidance_scale
+        self.t_shift = t_shift
+        self.position_temperature = position_temperature
+        self.class_temperature = class_temperature
+        self.preprocess_prompt = preprocess_prompt
+        self.postprocess_output = postprocess_output
+        self.tail_padding_s = tail_padding_s
+        self.audio_chunk_duration = audio_chunk_duration
+        self.audio_chunk_threshold = audio_chunk_threshold
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -131,23 +157,55 @@ class OmniVoiceSynthesizer(VoiceSynthesizer):
         lang = language_name(self.language)
         ref_text = speaker_profile.reference_text or None
 
+        gen_kwargs = {
+            "num_step": self.num_step,
+            "denoise": self.denoise,
+            "guidance_scale": self.guidance_scale,
+            "t_shift": self.t_shift,
+            "position_temperature": self.position_temperature,
+            "class_temperature": self.class_temperature,
+            "preprocess_prompt": self.preprocess_prompt,
+            "postprocess_output": self.postprocess_output,
+            "audio_chunk_duration": self.audio_chunk_duration,
+            "audio_chunk_threshold": self.audio_chunk_threshold,
+        }
+
         def _synth(speed: float) -> np.ndarray:
             try:
                 audios = self._model.generate(
                     text=text, language=lang, ref_audio=(wav, sr),
                     ref_text=ref_text, speed=float(speed),
+                    **gen_kwargs
                 )
             except Exception as exc:  # noqa: BLE001 - retry without conditioning
                 LOG.warning(f"OmniVoice generate failed ({exc}); retrying minimally")
+                # If we retry, we might want to still keep some settings, 
+                # but typically retry is for "it failed because of specific conditioning"
                 audios = self._model.generate(
                     text=text, language=lang, ref_audio=(wav, sr), ref_text=ref_text,
+                    **gen_kwargs
                 )
             if not audios:
                 raise RuntimeError("OmniVoice returned no audio")
             a = audios[0]
             if isinstance(a, torch.Tensor):
                 a = a.detach().cpu().numpy()
-            return np.asarray(a, dtype=np.float32).reshape(-1)
+            samples = np.asarray(a, dtype=np.float32).reshape(-1)
+
+            # Apply a small fade-out (50ms) to the end of generated speech 
+            # to prevent clicks and abrupt cutoffs.
+            fade_len = int(min(len(samples), 0.05 * self.sample_rate))
+            if fade_len > 0:
+                fade_curve = np.linspace(1.0, 0.0, fade_len)
+                samples[-fade_len:] *= fade_curve
+
+            # Apply tail padding to give the speech room to breathe 
+            # (especially useful if OmniVoice trimmed it too tightly).
+            if self.tail_padding_s > 0:
+                pad_len = int(self.tail_padding_s * self.sample_rate)
+                samples = np.concatenate([samples, np.zeros(pad_len, dtype=np.float32)])
+
+            return samples
 
         seg = fit_by_speed(
             _synth, self.sample_rate, target_duration, base_speed=base_speed,

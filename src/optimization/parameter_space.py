@@ -109,6 +109,14 @@ _DEFAULT_PARAMETERS: List[Parameter] = [
     Parameter("generate.max_speed", "float", 1.35, low=1.10, high=1.60, step=0.05),
     Parameter("generate.max_fit_iters", "int", 2, low=1, high=4, step=1),
     Parameter("generate.use_clone_prompt", "bool", True),
+    # OmniVoice-specific generation quality (decoded/sampling).
+    # These map to the 'generate' stage via to_stage_overrides.
+    Parameter("omnivoice.num_step", "int", 32, low=16, high=64, step=8),
+    Parameter("omnivoice.guidance_scale", "float", 2.0, low=1.0, high=5.0, step=0.5),
+    Parameter("omnivoice.t_shift", "float", 0.1, low=0.05, high=0.5, step=0.05),
+    Parameter("omnivoice.preprocess_prompt", "bool", True),
+    Parameter("omnivoice.postprocess_output", "bool", True),
+    Parameter("omnivoice.tail_padding_s", "float", 0.1, low=0.0, high=0.5, step=0.05),
     # Duration alignment thresholds (timing vs lossy-stretch trade-off).
     Parameter("align.tolerance", "float", 0.10, low=0.05, high=0.25, step=0.025),
     Parameter("align.min_abs_correction_s", "float", 0.12, low=0.05, high=0.30, step=0.025),
@@ -194,12 +202,28 @@ DEFAULT_SPACE = ParameterSpace(_DEFAULT_PARAMETERS)
 
 def to_stage_overrides(config: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """Turn a flat ``{"stage.attr": value}`` config into the nested
-    ``{stage: {attr: value}}`` map :class:`WorkspacePipeline` expects."""
+    ``{stage: {attr: value}}`` map :class:`WorkspacePipeline` expects.
+    
+    Also handles an ``"omnivoice"`` block by mapping it to the ``generate``
+    stage.
+    """
     overrides: Dict[str, Dict[str, Any]] = {}
     for name, value in config.items():
+        if isinstance(value, dict):
+            # Nested block (e.g. "omnivoice": { ... })
+            target_stage = name
+            if target_stage == "omnivoice":
+                target_stage = "generate"
+            overrides.setdefault(target_stage, {}).update(value)
+            continue
+            
         stage, _, attr = name.partition(".")
         if not attr:
             continue
+        
+        if stage == "omnivoice":
+            stage = "generate"
+            
         overrides.setdefault(stage, {})[attr] = value
     return overrides
 

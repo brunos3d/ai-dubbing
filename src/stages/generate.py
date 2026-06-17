@@ -191,6 +191,10 @@ class GenerateStage:
     config_fields: List[str] = [
         "model_id", "target_language", "use_clone_prompt",
         "max_speed", "max_fit_iters", "tts_backend",
+        "num_step", "denoise", "guidance_scale", "t_shift",
+        "position_temperature", "class_temperature",
+        "preprocess_prompt", "postprocess_output", "tail_padding_s",
+        "audio_chunk_duration", "audio_chunk_threshold",
     ]
 
     def __init__(
@@ -210,6 +214,18 @@ class GenerateStage:
         f5_ckpt_file: str = "",
         f5_vocab_file: str = "",
         subdir: str | None = None,
+        # New OmniVoice parameters
+        num_step: int = 32,
+        denoise: bool = True,
+        guidance_scale: float = 2.0,
+        t_shift: float = 0.1,
+        position_temperature: float = 5.0,
+        class_temperature: float = 0.0,
+        preprocess_prompt: bool = True,
+        postprocess_output: bool = True,
+        tail_padding_s: float = 0.1,
+        audio_chunk_duration: float = 15.0,
+        audio_chunk_threshold: float = 30.0,
     ):
         self.workdir = Path(workdir)
         if subdir:
@@ -230,6 +246,19 @@ class GenerateStage:
         self.f5_ckpt_file = f5_ckpt_file
         self.f5_vocab_file = f5_vocab_file
         self.subdir = subdir
+        
+        # New OmniVoice parameters
+        self.num_step = num_step
+        self.denoise = denoise
+        self.guidance_scale = guidance_scale
+        self.t_shift = t_shift
+        self.position_temperature = position_temperature
+        self.class_temperature = class_temperature
+        self.preprocess_prompt = preprocess_prompt
+        self.postprocess_output = postprocess_output
+        self.tail_padding_s = tail_padding_s
+        self.audio_chunk_duration = audio_chunk_duration
+        self.audio_chunk_threshold = audio_chunk_threshold
 
     def _make_synthesizer(self):
         """Build the selected :class:`VoiceSynthesizer` (model loads lazily)."""
@@ -241,8 +270,21 @@ class GenerateStage:
             "max_fit_iters": self.max_fit_iters,
         }
         if self.tts_backend == "omnivoice":
-            kwargs["model_id"] = self.model_id
-            kwargs["offload_dir"] = self.offload_dir
+            kwargs.update({
+                "model_id": self.model_id,
+                "offload_dir": self.offload_dir,
+                "num_step": self.num_step,
+                "denoise": self.denoise,
+                "guidance_scale": self.guidance_scale,
+                "t_shift": self.t_shift,
+                "position_temperature": self.position_temperature,
+                "class_temperature": self.class_temperature,
+                "preprocess_prompt": self.preprocess_prompt,
+                "postprocess_output": self.postprocess_output,
+                "tail_padding_s": self.tail_padding_s,
+                "audio_chunk_duration": self.audio_chunk_duration,
+                "audio_chunk_threshold": self.audio_chunk_threshold,
+            })
         elif self.tts_backend == "f5tts":
             kwargs["model"] = self.f5_model
             if self.f5_ckpt_file:
