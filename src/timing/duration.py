@@ -45,6 +45,16 @@ SPEAKING_RATE_SYL_S: dict[str, float] = {
 }
 DEFAULT_RATE_SYL_S: float = 4.6
 
+# Calibration: neural TTS (OmniVoice) speaks faster than the conversational
+# reference tempos above. Measured on the Elon/Colbert workspace the literature
+# rates over-predicted actual synthesized duration by a median of ~27% across
+# 24 segments, which inflated every rate factor and the "needs stretch" count.
+# Scaling the language-default rate up by this factor calibrates the estimate
+# to the synthesis engine so the timing report and stretch decisions reflect
+# reality. Applied only to language defaults; an explicit ``rate_syl_s``
+# override (e.g. a speaker's measured tempo) is respected verbatim.
+SYNTHESIS_TEMPO_FACTOR: float = 1.25
+
 # Pause budget (seconds) added per punctuation mark.
 _SENTENCE_PAUSE_S: float = 0.25
 _CLAUSE_PAUSE_S: float = 0.12
@@ -176,7 +186,10 @@ def estimate_duration(
         return DurationEstimate(0.0, 0, rate_syl_s or speaking_rate(lang), 0.0, "empty")
 
     syllables = estimate_syllables(text, lang)
-    rate = rate_syl_s if (rate_syl_s and rate_syl_s > 0) else speaking_rate(lang)
+    if rate_syl_s and rate_syl_s > 0:
+        rate = rate_syl_s
+    else:
+        rate = speaking_rate(lang) * SYNTHESIS_TEMPO_FACTOR
     speech_time = syllables / rate if rate > 0 else 0.0
     pause = _pause_budget(text, speech_time)
     total = speech_time + pause

@@ -27,6 +27,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ..timing.condense import condense_candidates
 from ..timing.score import select_candidate
 from ..utils.entities import EntityPreserver
 from ..utils.logging import get_logger, stage_banner
@@ -304,6 +305,14 @@ def translate_segments(
         else:
             backend_fail += 1
             raw_candidates = [(protected, "passthrough")]
+
+        # 2b. Add condensed (shorter, still-natural) variants so the timing
+        #     selector can prefer a fitting translation over a literal one that
+        #     overflows the slot (Failure #3 — "natural timing over literal").
+        expanded: List[tuple] = []
+        for cand_text, cand_backend in raw_candidates:
+            expanded.extend(condense_candidates(cand_text, cand_backend, tgt))
+        raw_candidates = expanded
 
         # 3. Restore entities on every candidate (no-op without a glossary).
         candidates = [(preserver.restore(c), b) for c, b in raw_candidates]
