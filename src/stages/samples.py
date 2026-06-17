@@ -21,7 +21,7 @@ import numpy as np
 
 from ..utils.audio import compute_snr_db, read_wav, rms_normalize, write_wav
 from ..utils.logging import get_logger, stage_banner
-from ..utils.vram import free_vram, log_vram
+from ..utils.vram import free_vram, free_vram_aggressive, log_vram
 
 LOG = get_logger("ai-dubbing.samples")
 
@@ -336,7 +336,7 @@ def _transcribe_reference(
                 del model
             except Exception:
                 pass
-            free_vram()
+            free_vram_aggressive()
 
 
 def build_speaker_profiles(
@@ -500,7 +500,7 @@ def build_speaker_profiles(
                 del whisper_tiny
             except Exception:
                 pass
-            free_vram()
+            free_vram_aggressive()
 
     return out
 
@@ -575,7 +575,7 @@ class SampleStage:
         LOG.info("=" * 60)
 
         log_vram(LOG)
-        free_vram()
+        free_vram_aggressive()
         return {
             "speaker_samples": speaker_samples,
             "ref_transcripts": ref_transcripts,

@@ -15,7 +15,7 @@ from ..tts import SpeakerProfile, make_synthesizer
 from ..tts.base import fit_by_speed, next_speed as _next_speed  # re-export (compat)
 from ..utils.audio import read_wav, write_wav
 from ..utils.logging import get_logger, stage_banner
-from ..utils.vram import free_vram, log_vram
+from ..utils.vram import free_vram, free_vram_aggressive, log_vram
 from ..workspace.atomic import sha256_file
 from ..workspace.timeline import segment_render_key
 
@@ -369,7 +369,8 @@ class GenerateStage:
                     del whisper_tiny
                 except Exception:
                     pass
-                free_vram()
+                # Use aggressive cleanup to fully release CUDA memory
+                free_vram_aggressive()
 
         # --- Prosody analysis (spec Phase 5) -------------------------------
         # Pull cheap delivery cues out of the source speech so synthesis can
@@ -610,7 +611,11 @@ class GenerateStage:
                 synth.close()
             except Exception:
                 pass
-        free_vram()
+            # Explicitly delete the synthesizer reference to help garbage collection
+            del synth
+            synth = None
+        # Use aggressive cleanup to fully release CUDA memory between optimization iterations
+        free_vram_aggressive()
         log_vram(LOG)
         return {
             "generated_dir": str(self.out_dir),
