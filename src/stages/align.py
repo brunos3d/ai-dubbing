@@ -21,6 +21,22 @@ from ..utils.vram import free_vram, log_vram
 LOG = get_logger("ai-dubbing.align")
 
 
+def _needs_correction(
+    cur_dur: float, target_dur: float, tol: float, min_abs_s: float
+) -> bool:
+    """Whether a segment is far enough off-target to justify time-stretching.
+
+    Requires BOTH a relative error above ``tol`` AND an absolute error above
+    ``min_abs_s``. The absolute floor stops pointless lossy micro-stretches on
+    short segments (a 0.7s clip 0.08s off is 11% but inaudible), which matters
+    now that word-level speaker splitting yields more short segments.
+    """
+    if target_dur <= 0:
+        return False
+    delta = abs(cur_dur - target_dur)
+    return (delta / max(target_dur, 0.05) > tol) and (delta > min_abs_s)
+
+
 def _stretch_with_ffmpeg(input_path: Path, output_path: Path, rate: float) -> bool:
     """Use ffmpeg's atempo filter for fast, high-quality time-stretching.
 
@@ -146,6 +162,7 @@ class AlignStage:
     config_fields: List[str] = [
         "target_language",
         "tolerance",
+        "min_abs_correction_s",
         "regenerate_with_duration",
     ]
 
@@ -154,6 +171,7 @@ class AlignStage:
         workdir: Path,
         target_language: str,
         tolerance: float = 0.10,
+        min_abs_correction_s: float = 0.12,
         out_dir_name: str = "aligned_segments",
         regenerate_with_duration: bool = False,
         subdir: str | None = None,
@@ -163,6 +181,9 @@ class AlignStage:
             self.workdir = self.workdir / subdir
         self.target_language = target_language
         self.tolerance = tolerance
+        # Skip lossy stretching when the absolute error is imperceptible, even
+        # if it exceeds the relative tolerance (matters for short segments).
+        self.min_abs_correction_s = min_abs_correction_s
         self.out_dir = self.workdir / out_dir_name
         self.regenerate_with_duration = regenerate_with_duration
         self.subdir = subdir
@@ -221,13 +242,12 @@ class AlignStage:
                 f"Aligning {src_path.name}: cur={cur_dur:.2f}s -> target={target_dur:.2f}s"
             )
 
+            needs_fix = _needs_correction(
+                cur_dur, target_dur, self.tolerance, self.min_abs_correction_s
+            )
             new_audio: Optional[np.ndarray] = None
             new_sr = entry.get("sample_rate", 24000)
-            if (
-                model is not None
-                and target_dur > 0
-                and abs(cur_dur - target_dur) / max(target_dur, 0.05) > self.tolerance
-            ):
+            if model is not None and target_dur > 0 and needs_fix:
                 seg = {"text": entry.get("text", ""), "speaker": entry.get("speaker")}
                 new_audio = _regenerate_with_duration(
                     model, seg, samples_map, self.target_language, target_dur,
@@ -236,11 +256,7 @@ class AlignStage:
                     method = "regenerate_duration"
                     chosen_dur = new_audio.shape[0] / float(new_sr)
 
-            if (
-                new_audio is None
-                and target_dur > 0
-                and abs(cur_dur - target_dur) / max(target_dur, 0.05) > self.tolerance
-            ):
+            if new_audio is None and target_dur > 0 and needs_fix:
                 chosen_dur = _stretch_one(src_path, out_path, target_dur)
                 method = "time_stretch"
             else:
