@@ -58,6 +58,24 @@ def _free_vram_quiet() -> None:
         pass
 
 
+def _free_vram_aggressive_quiet() -> None:
+    """Aggressively free VRAM without logging."""
+    try:
+        from ..utils.vram import free_vram_aggressive
+        free_vram_aggressive()
+    except Exception:
+        pass
+
+
+def _log_vram_quiet() -> None:
+    """Log current VRAM usage."""
+    try:
+        from ..utils.vram import log_vram
+        log_vram(LOG)
+    except Exception:
+        pass
+
+
 @dataclass
 class EvaluationResult:
     """The outcome of evaluating one configuration."""
@@ -218,6 +236,10 @@ class PipelineEvaluator:
         A second OOM (or any other error) is recorded as ``failed`` and the
         loop moves on.
         """
+        # Aggressively free VRAM at the start of each iteration to prevent
+        # accumulation across multiple evaluations
+        _free_vram_aggressive_quiet()
+        
         from_stage = self._stages_to_run(config)
         started = time.time()
         runner = self._runner or self._default_run
@@ -231,7 +253,7 @@ class PipelineEvaluator:
                 root = runner(config, from_stage, self.to_stage)
                 self.workspace_root = Path(root)
                 result = self._scorer(self.workspace_root)
-                _free_vram_quiet()
+                _free_vram_aggressive_quiet()
                 return EvaluationResult(
                     status="ok",
                     score=result.composite,
@@ -243,7 +265,7 @@ class PipelineEvaluator:
             except KeyboardInterrupt:
                 raise
             except Exception as exc:  # noqa: BLE001 - record and continue
-                _free_vram_quiet()
+                _free_vram_aggressive_quiet()
                 if attempt + 1 < max_attempts and _is_oom(exc):
                     LOG.warning(
                         "CUDA OOM on attempt %d for config %s; freed VRAM, retrying once",

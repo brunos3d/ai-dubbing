@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..utils.logging import get_logger
+from ..utils.vram import free_vram_aggressive, log_vram
 from ..workspace.paths import slugify, workspaces_root
 from .evaluator import PipelineEvaluator
 from .history import HistoryStore, IterationRecord
@@ -166,6 +167,13 @@ class Optimizer:
             LOG.info("[iter %d] %s config: %s", i, proposal.source, config)
 
             result = self.evaluator.evaluate(config)
+            
+            # Log VRAM usage after each iteration to track memory leaks
+            log_vram(LOG)
+            
+            # Aggressively free VRAM between iterations to prevent accumulation
+            free_vram_aggressive()
+            
             record = IterationRecord(
                 iteration=i,
                 score=result.score,
