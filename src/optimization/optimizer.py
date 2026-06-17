@@ -156,77 +156,91 @@ class Optimizer:
 
         no_improve = 0
         i = start_iter
-        while infinite or i < cfg.iterations:
-            proposal = self.searcher.propose(
-                rng,
-                best_config=best_config,
-                stale_steps=stale_steps,
-                have_baseline=have_baseline,
-            )
-            config = self.space.coerce_config(proposal.config)
-            LOG.info("[iter %d] %s config: %s", i, proposal.source, config)
-
-            result = self.evaluator.evaluate(config)
-            
-            # Log VRAM usage after each iteration to track memory leaks
-            log_vram(LOG)
-            
-            # Aggressively free VRAM between iterations to prevent accumulation
-            free_vram_aggressive()
-            
-            record = IterationRecord(
-                iteration=i,
-                score=result.score,
-                parameters=config,
-                metrics=result.metrics,
-                status=result.status,
-                error=result.error,
-                from_stage=result.from_stage,
-                duration_s=result.duration_s,
-                timestamp=_now_iso(),
-                source=proposal.source,
-            )
-            self.history.append(record)
-            have_baseline = have_baseline or proposal.source == "baseline"
-
-            improved = (
-                result.status == "ok"
-                and result.score is not None
-                and (best_score is None or result.score > best_score)
-            )
-            if improved:
-                best_score = result.score
-                best_config = config
-                stale_steps = 0
-                no_improve = 0
-                LOG.info("[iter %d] NEW BEST score=%.5f", i, best_score)
-            else:
-                stale_steps += 1
-                no_improve += 1
-                status = result.status if result.status == "failed" else "no improvement"
-                LOG.info(
-                    "[iter %d] %s (score=%s, best=%s)",
-                    i, status,
-                    (round(result.score, 5) if result.score is not None else None),
-                    (round(best_score, 5) if best_score is not None else None),
+        try:
+            while infinite or i < cfg.iterations:
+                proposal = self.searcher.propose(
+                    rng,
+                    best_config=best_config,
+                    stale_steps=stale_steps,
+                    have_baseline=have_baseline,
                 )
+                config = self.space.coerce_config(proposal.config)
+                LOG.info("[iter %d] %s config: %s", i, proposal.source, config)
 
+                result = self.evaluator.evaluate(config)
+                
+                # Log VRAM usage after each iteration to track memory leaks
+                log_vram(LOG)
+                
+                # Aggressively free VRAM between iterations to prevent accumulation
+                free_vram_aggressive()
+                
+                record = IterationRecord(
+                    iteration=i,
+                    score=result.score,
+                    parameters=config,
+                    metrics=result.metrics,
+                    status=result.status,
+                    error=result.error,
+                    from_stage=result.from_stage,
+                    duration_s=result.duration_s,
+                    timestamp=_now_iso(),
+                    source=proposal.source,
+                )
+                self.history.append(record)
+                have_baseline = have_baseline or proposal.source == "baseline"
+
+                improved = (
+                    result.status == "ok"
+                    and result.score is not None
+                    and (best_score is None or result.score > best_score)
+                )
+                if improved:
+                    best_score = result.score
+                    best_config = config
+                    stale_steps = 0
+                    no_improve = 0
+                    LOG.info("[iter %d] NEW BEST score=%.5f", i, best_score)
+                else:
+                    stale_steps += 1
+                    no_improve += 1
+                    status = result.status if result.status == "failed" else "no improvement"
+                    LOG.info(
+                        "[iter %d] %s (score=%s, best=%s)",
+                        i, status,
+                        (round(result.score, 5) if result.score is not None else None),
+                        (round(best_score, 5) if best_score is not None else None),
+                    )
+
+                self.history.save_state({
+                    "rng": rng_to_state(rng),
+                    "stale_steps": stale_steps,
+                    "last_iteration": i,
+                    "best_score": best_score,
+                    "workspace_root": str(self.evaluator.workspace_root or ""),
+                    "language": cfg.language,
+                    "updated_at": _now_iso(),
+                })
+
+                if cfg.early_stop_patience and no_improve >= cfg.early_stop_patience:
+                    LOG.info(
+                        "Early stop: %d iterations without improvement", no_improve
+                    )
+                    break
+                i += 1
+        except KeyboardInterrupt:
+            LOG.info("Interrupted by user. Run is resumable.")
+            # Save state before exiting
             self.history.save_state({
                 "rng": rng_to_state(rng),
                 "stale_steps": stale_steps,
-                "last_iteration": i,
+                "last_iteration": i - 1 if i > start_iter else start_iter,
                 "best_score": best_score,
                 "workspace_root": str(self.evaluator.workspace_root or ""),
                 "language": cfg.language,
                 "updated_at": _now_iso(),
             })
-
-            if cfg.early_stop_patience and no_improve >= cfg.early_stop_patience:
-                LOG.info(
-                    "Early stop: %d iterations without improvement", no_improve
-                )
-                break
-            i += 1
+            raise
 
         summary = self.history.summary()
         summary["workspace_root"] = str(self.evaluator.workspace_root or "")
