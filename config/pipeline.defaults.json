@@ -6,5 +6,18 @@
   "generate.max_fit_iters": 2,
   "generate.use_clone_prompt": true,
   "align.tolerance": 0.10,
-  "align.min_abs_correction_s": 0.12
+  "align.min_abs_correction_s": 0.12,
+  "omnivoice": {
+    "num_step": 32,
+    "denoise": true,
+    "guidance_scale": 2.0,
+    "t_shift": 0.1,
+    "position_temperature": 5.0,
+    "class_temperature": 0.0,
+    "preprocess_prompt": true,
+    "postprocess_output": true,
+    "tail_padding_s": 0.1,
+    "audio_chunk_duration": 15.0,
+    "audio_chunk_threshold": 30.0
+  }
 }
