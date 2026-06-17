@@ -22,19 +22,38 @@ LOG = get_logger("ai-dubbing.align")
 
 
 def _needs_correction(
-    cur_dur: float, target_dur: float, tol: float, min_abs_s: float
+    cur_dur: float,
+    target_dur: float,
+    tol: float,
+    min_abs_s: float,
+    underrun_tol: float = 0.25,
+    underrun_min_abs_s: float = 0.35,
 ) -> bool:
     """Whether a segment is far enough off-target to justify time-stretching.
 
-    Requires BOTH a relative error above ``tol`` AND an absolute error above
-    ``min_abs_s``. The absolute floor stops pointless lossy micro-stretches on
-    short segments (a 0.7s clip 0.08s off is 11% but inaudible), which matters
-    now that word-level speaker splitting yields more short segments.
+    The decision is **asymmetric** because the two error directions have very
+    different perceptual costs once segments are placed at their original
+    start time:
+
+    * **Overrun** (dub longer than the slot) bleeds into the next turn, so it
+      is corrected at the tight ``tol`` / ``min_abs_s`` thresholds.
+    * **Underrun** (dub shorter than the slot) just leaves a trailing gap — a
+      natural pause — so slowing the voice to fill it is usually worse than
+      leaving it. Underruns are only corrected when large (``underrun_tol`` /
+      ``underrun_min_abs_s``), which avoids the unnatural drag that creeps in
+      now that condensed Portuguese often synthesises shorter than the slot.
+
+    Both directions require a relative AND an absolute threshold to be crossed,
+    so trivial sub-perceptual offsets never trigger a lossy resampling pass.
     """
     if target_dur <= 0:
         return False
-    delta = abs(cur_dur - target_dur)
-    return (delta / max(target_dur, 0.05) > tol) and (delta > min_abs_s)
+    delta = cur_dur - target_dur
+    ad = abs(delta)
+    if delta > 0:  # overrun -> compress (speed up)
+        return (ad / max(target_dur, 0.05) > tol) and (ad > min_abs_s)
+    # underrun -> expand (slow down); be far more permissive.
+    return (ad / max(target_dur, 0.05) > underrun_tol) and (ad > underrun_min_abs_s)
 
 
 def _stretch_with_ffmpeg(input_path: Path, output_path: Path, rate: float) -> bool:
