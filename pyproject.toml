@@ -32,6 +32,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Alternative TTS backend (selectable via --tts-backend f5tts). Kept optional
+# so the core install stays lean; install with `pip install -e .[f5tts]`.
+f5tts = ["f5-tts>=1.1.0"]
 torch-cuda = [
     "torch==2.8.0",
     "torchaudio==2.8.0",
