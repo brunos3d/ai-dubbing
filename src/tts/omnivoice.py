@@ -14,7 +14,7 @@ import torch
 
 from ..utils.audio import read_wav
 from ..utils.logging import get_logger
-from ..utils.vram import free_vram
+from ..utils.vram import free_vram_aggressive
 from .base import (
     AudioSegment,
     SpeakerProfile,
@@ -130,12 +130,22 @@ class OmniVoiceSynthesizer(VoiceSynthesizer):
         self._model_sr = int(getattr(self._model, "sampling_rate", _DEFAULT_SR))
 
     def _close(self) -> None:
-        try:
-            del self._model
-        except Exception:
-            pass
-        self._model = None
-        free_vram()
+        """Unload the model and aggressively free CUDA memory."""
+        if self._model is not None:
+            try:
+                # Move model to CPU first to release GPU memory
+                if hasattr(self._model, 'cpu'):
+                    try:
+                        self._model.cpu()
+                    except Exception:
+                        pass
+                # Delete the model reference
+                del self._model
+            except Exception:
+                pass
+            self._model = None
+        # Use aggressive cleanup to fully release CUDA memory
+        free_vram_aggressive()
 
     @property
     def sample_rate(self) -> int:
